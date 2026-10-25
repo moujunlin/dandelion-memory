@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: str = Field(min_length=1)
     timestamp: int | None = Field(default=None, ge=0)
 
@@ -101,3 +101,12 @@ class MemoryCandidate:
     anchor_id: str | None = None
     anchor_rank: int | None = None
     distance: int | None = None
+    kind: str = "raw_slice"
+    parent_msg_id: str | None = None
+    seq: int = 0
+    session_ts: int | None = None
+    subject: str = "user"
+    tag: str | None = None
+    event_time_start: int | None = None
+    event_time_end: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
