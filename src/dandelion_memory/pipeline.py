@@ -700,10 +700,6 @@ class MemoryPipeline:
             if not pmid or pmid not in parents_map:
                 continue
             parent = parents_map[pmid]
-            if int(parent["tombstoned"]) == 1:
-                continue
-
-            p_content = str(parent["content"] or "")
             p_seq = int(parent["seq"])
             p_ts = int(parent["session_ts"]) if parent["session_ts"] is not None else None
 
@@ -714,6 +710,38 @@ class MemoryPipeline:
                     p_ts is not None and l_ts is not None and (p_ts, p_seq) >= (l_ts, l_seq)
                 ):
                     is_latest = True
+
+            if int(parent["tombstoned"]) == 1:
+                # If raw parent was tombstoned (e.g. mixed message with a forget command),
+                # never expose raw_slice, but allow surviving non-tombstoned fact_item
+                if kind == "fact_item":
+                    t_str = str(parent["session_time_str"] or "")
+                    t_header = f" | {t_str}" if t_str else ""
+                    fact_body = (
+                        f"[#{p_seq} | {parent['speaker']}{t_header}] "
+                        f"[提炼事实: {c['display_text']}]"
+                    )
+                    dialogue_candidates[cid] = MemoryCandidate(
+                        id=cid,
+                        content=fact_body,
+                        score=c_rrf,
+                        created_at=t_str or None,
+                        session_id=str(parent["session_id"]),
+                        kind="fact_item",
+                        parent_msg_id=pmid,
+                        seq=p_seq,
+                        session_ts=p_ts,
+                        subject=subj,
+                        tag=tg,
+                        metadata={
+                            "rrf_norm": c_rrf,
+                            "is_latest_in_tag": is_latest,
+                            "is_global_constraint": False,
+                        },
+                    )
+                continue
+
+            p_content = str(parent["content"] or "")
 
             # Long document (>3000 chars): return raw_slice without parent/neighbor expansion (F3)
             if len(p_content) > LONG_DOC_CHAR_THRESHOLD:

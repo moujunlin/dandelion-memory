@@ -624,7 +624,7 @@ class SQLiteStore:
         )
         conn.execute(
             f"UPDATE search_chunks SET tombstoned = 1 "
-            f"WHERE user_id = ? AND seq IN ({placeholders})",
+            f"WHERE user_id = ? AND kind = 'raw_slice' AND seq IN ({placeholders})",
             [user_id, *seq_list],
         )
         self._maybe_commit()
@@ -782,13 +782,14 @@ class SQLiteStore:
                     (masked, pmid),
                 )
             else:
-                # Normal parent message <= 3000 chars: tombstone parent and all its chunks
+                # Normal parent message <= 3000 chars: tombstone parent and its raw_slice chunks
                 conn.execute(
                     "UPDATE parent_messages SET tombstoned = 1 WHERE msg_id = ?",
                     (pmid,),
                 )
                 conn.execute(
-                    "UPDATE search_chunks SET tombstoned = 1 WHERE parent_msg_id = ?",
+                    "UPDATE search_chunks SET tombstoned = 1 "
+                    "WHERE parent_msg_id = ? AND kind = 'raw_slice'",
                     (pmid,),
                 )
 

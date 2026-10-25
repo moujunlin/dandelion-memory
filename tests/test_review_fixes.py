@@ -647,3 +647,118 @@ def test_dashscope_clients_survive_across_multiple_closed_event_loops(
     )
     assert r2.status_code == 200
 
+
+async def test_same_message_mixed_new_fact_and_forget_directive_preserves_new_fact(
+    db_path: Path,
+):
+    """Same seq containing both a new state update and an explicit forget command."""
+    extractor = FakeExtractor(
+        responses=[
+            {
+                "facts": [
+                    {
+                        "source_seqs": [1],
+                        "subject": "user",
+                        "is_other_person": False,
+                        "tag": "居住地",
+                        "fact_text": "用户居住在北京市海淀区",
+                        "prev_state": "",
+                        "current_state": "北京市海淀区",
+                        "update_reason": "初始居住地",
+                        "event_date_start": "2023-01-01",
+                        "event_date_end": "2023-01-01",
+                    },
+                    {
+                        "source_seqs": [2],
+                        "subject": "user",
+                        "is_other_person": False,
+                        "tag": "安全/密码",
+                        "fact_text": "用户的备用保险箱密码是 849201",
+                        "prev_state": "",
+                        "current_state": "849201",
+                        "update_reason": "初始记录",
+                        "event_date_start": "2023-01-01",
+                        "event_date_end": "2023-01-01",
+                    },
+                ],
+                "forget_actions": [],
+            },
+            # Batch 2 (seq=3): user moves to Shanghai Xuhui AND asks to forget 849201 in ONE message
+            {
+                "facts": [
+                    {
+                        "source_seqs": [3],
+                        "subject": "user",
+                        "is_other_person": False,
+                        "tag": "居住地",
+                        "fact_text": "用户搬家到上海市徐汇区了",
+                        "prev_state": "北京市海淀区",
+                        "current_state": "上海市徐汇区",
+                        "update_reason": "昨天正式搬家",
+                        "event_date_start": "2024-05-01",
+                        "event_date_end": "2024-05-01",
+                    }
+                ],
+                "forget_actions": [
+                    {
+                        "trigger_seq": 3,
+                        "target_existing_tags": ["安全/密码"],
+                        "target_keywords": ["849201", "备用保险箱密码"],
+                        "target_description": "用户的备用保险箱密码是 849201",
+                        "batch_seqs_to_tombstone": [3],
+                    }
+                ],
+            },
+        ]
+    )
+    pipeline, *_ = build_v2_pipeline(db_path=db_path, extractor=extractor)
+
+    await pipeline.add(
+        AddRequest(
+            request_id="req-mix-1",
+            user_id="u_mix",
+            session_id="s_mix_1",
+            messages=[
+                {"role": "user", "content": "我目前住在北京市海淀区。", "timestamp": 1672531200000},
+                {
+                    "role": "user",
+                    "content": "我的备用保险箱密码是 849201。",
+                    "timestamp": 1672531260000,
+                },
+            ],
+        )
+    )
+    await pipeline.add(
+        AddRequest(
+            request_id="req-mix-2",
+            user_id="u_mix",
+            session_id="s_mix_2",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "我昨天正式搬家到上海市徐汇区了。"
+                        "另外请彻底忘掉我的备用保险箱密码 849201，以后绝不要再提。"
+                    ),
+                    "timestamp": 1714608000000,
+                }
+            ],
+        )
+    )
+
+    # 1. Secret 849201 must never leak
+    s_secret = await pipeline.search(
+        SearchRequest(query="备用保险箱密码是多少 849201", user_id="u_mix", top_k=10)
+    )
+    assert all("849201" not in item.content for item in s_secret.data)
+
+    # 2. New residence "上海市徐汇区" timeline and fact_item must survive and be returned!
+    s_home = await pipeline.search(
+        SearchRequest(query="用户现在住在哪里", user_id="u_mix", top_k=5)
+    )
+    assert len(s_home.data) >= 1
+    combined = "\n".join(item.content for item in s_home.data)
+    assert "上海市徐汇区" in combined
+    assert "849201" not in combined
+
+
