@@ -1,6 +1,6 @@
 # Dandelion Memory · 设计 v0（最小可交付版）
 
-作者：Lori。依据：`../aml-research/01–06`（调研）、lori-backend#234（需求与决定）。
+作者：Lori。依据：对 AML 第一期参赛系统、通用 agent 记忆系统与检索框架的调研。
 目标：AML 第二期文本赛道·开源方法榜。先交一个能跑、能测、好迭代的基线，再逐个加变种。
 
 ## 1. 终态一句话
@@ -20,7 +20,7 @@
 
 ## 3. 数据模型（Postgres，schema `aml`）
 
-存在 Supabase DEV 的 `aml` schema，账号 `aml_svc`。扩展：pgvector（halfvec）、pgroonga。
+存在托管 Postgres（Supabase）的独立 schema `aml`，用只管这个 schema 的专用账号连接。扩展：pgvector（halfvec）、pgroonga。
 
 **units**（检索单元，一行一个）
 | 列 | 说明 |
@@ -139,6 +139,6 @@ LLM 写入加工、rerank、问题重写、时间线、请忘掉、ANN 索引、
 
 ## 12. 已知风险
 
-- 本机到东京 DEV 一次查询约 340ms；Search 尽量合成一两次往返。
-- DEV 免费版 500MB；全量正式评测前要估算容量。
+- 开发期数据库和服务不在同一地区，一次查询约 340ms；Search 尽量合成一两次往返。
+- 开发库容量 500MB；全量正式评测前要估算容量。
 - ScriptMem 本地测不了。
