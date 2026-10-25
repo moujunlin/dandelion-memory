@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -61,19 +63,38 @@ class DashScopeReranker:
         self.model = model
         self.timeout = timeout
         self._client = client
+        self._client_loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def is_noop(self) -> bool:
         return not bool(self.api_key)
 
     def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
+        try:
+            current_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if (
+            self._client is None
+            or self._client.is_closed
+            or (
+                self._client_loop is not None
+                and (self._client_loop is not current_loop or self._client_loop.is_closed())
+            )
+        ):
             self._client = httpx.AsyncClient(timeout=self.timeout)
+            self._client_loop = current_loop
+        elif self._client_loop is None:
+            self._client_loop = current_loop
         return self._client
 
     async def aclose(self) -> None:
         if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
+            with contextlib.suppress(RuntimeError):
+                await self._client.aclose()
+        self._client = None
+        self._client_loop = None
 
     async def rerank(
         self, query: str, documents: Sequence[str], *args: Any, **kwargs: Any
@@ -96,17 +117,26 @@ class DashScopeReranker:
                 "top_n": len(doc_list),
             },
         }
-        client = self._get_client()
-        resp = await client.post(
-            self.base_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        resp.raise_for_status()
-        body = resp.json()
+        for attempt in range(2):
+            client = self._get_client()
+            try:
+                resp = await client.post(
+                    self.base_url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                break
+            except RuntimeError as exc:
+                if "Event loop is closed" in str(exc) and attempt == 0:
+                    self._client = None
+                    self._client_loop = None
+                    continue
+                raise
 
         scores = [0.0] * len(doc_list)
         results = (

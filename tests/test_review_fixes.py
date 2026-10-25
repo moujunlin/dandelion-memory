@@ -565,3 +565,85 @@ async def test_dashscope_clients_with_mock_transport():
     assert emb_calls == 2
     assert vecs == [[0.25, 0.75, 0.0, 0.0]]
     await embedder.aclose()
+
+
+def test_dashscope_clients_survive_across_multiple_closed_event_loops(
+    settings, db_path: Path
+):
+    """Verify internal _get_client() recreates AsyncClient when event loop changes or closes."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from dandelion_memory.api import create_app
+    from dandelion_memory.pipeline import MemoryPipeline
+    from dandelion_memory.store import SQLiteStore
+
+    embedder = DashScopeEmbedder(
+        api_key="sk-test",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="text-embedding-v4",
+        dimensions=4,
+    )
+    extractor = DashScopeExtractor(api_key="sk-test")
+    reranker = DashScopeReranker(api_key="sk-test")
+
+    # Simulate binding _get_client() to a first event loop that then closes
+    async def bind_in_first_loop():
+        c1 = embedder._get_client()
+        c2 = extractor._get_client()
+        c3 = reranker._get_client()
+        return c1, c2, c3, asyncio.get_running_loop()
+
+    first_emb_c, first_ext_c, first_rer_c, loop1 = asyncio.run(bind_in_first_loop())
+    assert loop1.is_closed()
+
+    # Now run in a brand new event loop: _get_client() must detect loop1 is closed and recreate
+    async def bind_in_second_loop():
+        c1_new = embedder._get_client()
+        c2_new = extractor._get_client()
+        c3_new = reranker._get_client()
+        assert c1_new is not first_emb_c
+        assert c2_new is not first_ext_c
+        assert c3_new is not first_rer_c
+        await embedder.aclose()
+        await extractor.aclose()
+        await reranker.aclose()
+
+    asyncio.run(bind_in_second_loop())
+
+    # Also verify non-context-managed TestClient(app) across two consecutive requests
+    pipeline = MemoryPipeline(
+        store=SQLiteStore(db_path),
+        embedder=FakeEmbedder(),
+        extractor=extractor,
+        reranker=NoOpReranker(),
+    )
+    app = create_app(settings=settings, pipeline=pipeline)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.memory_api_key}"}
+
+    r1 = client.post(
+        "/add",
+        json={
+            "request_id": "loop-req-1",
+            "user_id": "u_loop",
+            "session_id": "s_loop",
+            "messages": [{"role": "user", "content": "第一轮跨事件循环请求。"}],
+        },
+        headers=headers,
+    )
+    assert r1.status_code == 200
+
+    r2 = client.post(
+        "/add",
+        json={
+            "request_id": "loop-req-2",
+            "user_id": "u_loop",
+            "session_id": "s_loop",
+            "messages": [{"role": "user", "content": "第二轮跨事件循环请求。"}],
+        },
+        headers=headers,
+    )
+    assert r2.status_code == 200
+

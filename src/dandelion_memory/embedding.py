@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -34,20 +35,38 @@ class DashScopeEmbedder:
         self.timeout = timeout
         self.max_retries = max_retries
         self._client = client
+        self._client_loop: asyncio.AbstractEventLoop | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
+        try:
+            current_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if (
+            self._client is None
+            or self._client.is_closed
+            or (
+                self._client_loop is not None
+                and (self._client_loop is not current_loop or self._client_loop.is_closed())
+            )
+        ):
             self._client = httpx.AsyncClient(timeout=self.timeout)
+            self._client_loop = current_loop
+        elif self._client_loop is None:
+            self._client_loop = current_loop
         return self._client
 
     async def aclose(self) -> None:
         if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
+            with contextlib.suppress(RuntimeError):
+                await self._client.aclose()
+        self._client = None
+        self._client_loop = None
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
-        client = self._get_client()
         vectors: list[list[float]] = []
 
         for start in range(0, len(texts), self.batch_size):
@@ -57,6 +76,7 @@ class DashScopeEmbedder:
             ]
             last_exc: Exception | None = None
             for attempt in range(self.max_retries + 1):
+                client = self._get_client()
                 try:
                     response = await client.post(
                         f"{self.base_url}/embeddings",
@@ -84,6 +104,12 @@ class DashScopeEmbedder:
                     vectors.extend(batch_vectors)
                     last_exc = None
                     break
+                except RuntimeError as exc:
+                    if "Event loop is closed" in str(exc) and attempt < self.max_retries:
+                        self._client = None
+                        self._client_loop = None
+                        continue
+                    raise
                 except (httpx.TransportError, httpx.HTTPStatusError) as exc:
                     last_exc = exc
                     if (
