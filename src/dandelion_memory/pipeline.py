@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -9,7 +10,13 @@ from collections.abc import Sequence
 from typing import Any
 
 from .embedding import Embedder
-from .extractor import Extractor, RegexExtractor, sanitize_extraction_result
+from .extractor import (
+    ExtractedFact,
+    ExtractedForgetAction,
+    Extractor,
+    RegexExtractor,
+    sanitize_extraction_result,
+)
 from .models import (
     AddRequest,
     AddResponse,
@@ -45,6 +52,27 @@ W_DENSE = 1.5
 W_BM25 = 1.0
 W_TIME = 1.2
 NEIGHBOR_MAX_CHARS = 1000
+TIMELINE_PIN_MIN_SCORE = 0.40
+DRAFT_FALLBACK_THRESHOLD = 0.55
+DRAFT_MIN_SCORE = 0.30
+
+
+def _literal_cold_tag_overlap(tag_a: str, tag_b: str) -> float:
+    if not tag_a.startswith("其他/") or not tag_b.startswith("其他/"):
+        return 0.0
+    sa = tag_a[3:].strip().casefold()
+    sb = tag_b[3:].strip().casefold()
+    if not sa or not sb:
+        return 0.0
+    if sa == sb:
+        return 1.0
+    if (len(sa) >= 2 and sa in sb) or (len(sb) >= 2 and sb in sa):
+        return 0.80
+    toks_a = set(tokenize_bm25(sa))
+    toks_b = set(tokenize_bm25(sb))
+    if not toks_a or not toks_b:
+        return 0.0
+    return len(toks_a & toks_b) / max(1, min(len(toks_a), len(toks_b)))
 
 
 def _l2_normalize(vec: Sequence[float]) -> list[float]:
@@ -129,6 +157,14 @@ class MemoryPipeline:
         self.token_budget = token_budget
         self.chunk_target_chars = chunk_target_chars
         self.chunk_max_chars = chunk_max_chars
+        self._user_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_user_lock(self, user_id: str) -> asyncio.Lock:
+        lock = self._user_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._user_locks[user_id] = lock
+        return lock
 
     async def _invoke_extractor(
         self,
@@ -155,6 +191,10 @@ class MemoryPipeline:
         return await self._add_v1_compat(request, payload_hash)
 
     async def _add_v2(self, request: AddRequest, payload_hash: str) -> AddResponse:
+        async with self._get_user_lock(request.user_id):
+            return await self._add_v2_locked(request, payload_hash)
+
+    async def _add_v2_locked(self, request: AddRequest, payload_hash: str) -> AddResponse:
         assert isinstance(self.store, SQLiteStore)
 
         # Step 1: Idempotency check BEFORE any LLM or Embedding calls (F2.1)
@@ -186,95 +226,217 @@ class MemoryPipeline:
                 session_id=request.session_id,
             )
 
-        # Step 3: Wrap all state mutations & external calls in an atomic transaction (P0-2)
+        # Stage 1 (No DB write lock): Read state, slice in memory, and run concurrent LLM windows
+        last_seq, pending_forget = self.store.get_user_state(request.user_id)
+        inherited_ts = self.store.get_last_session_ts(request.user_id, request.session_id)
+        existing_tags = self.store.get_active_tags(request.user_id)
+
+        first_msg_auto_tombstone = (
+            pending_forget == 1 and non_sys_messages[0].role == "assistant"
+        )
+
+        batch_records: list[dict[str, Any]] = []
+        pending_raw_chunks: list[dict[str, Any]] = []
+
+        for idx, msg in enumerate(non_sys_messages):
+            seq = last_seq + idx + 1
+            if msg.timestamp is not None:
+                ts = normalize_timestamp_to_seconds(msg.timestamp)
+            else:
+                ts = parse_header_timestamp_seconds(msg.content)
+                if ts is None:
+                    ts = inherited_ts
+            if ts is not None:
+                inherited_ts = ts
+
+            time_str = format_session_time_str(ts)
+            speaker = extract_speaker(msg.content, msg.role)
+            msg_id = f"msg:{request.user_id}:{seq}"
+            is_tomb = 1 if (idx == 0 and first_msg_auto_tombstone) else 0
+
+            rec = {
+                "msg_id": msg_id,
+                "seq": seq,
+                "role": msg.role,
+                "speaker": speaker,
+                "content": msg.content,
+                "session_ts": ts,
+                "session_time_str": time_str,
+                "tombstoned": is_tomb,
+            }
+            batch_records.append(rec)
+
+            if is_tomb:
+                continue
+
+            hints = temporal_hints(msg.content, ts * 1000 if ts is not None else None)
+            hint_suffix = ("\n[resolved time: " + "; ".join(hints) + "]") if hints else ""
+            slices = slice_message_content(msg.content)
+            for c_idx, slice_str in enumerate(slices):
+                chunk_id = f"{msg_id}:raw:{c_idx:04d}"
+                header = f"[#{seq} | {speaker}" + (f" | {time_str}]" if time_str else "]")
+                search_text = f"{header} {slice_str}{hint_suffix}"
+                embed_input = f"{slice_str}{hint_suffix}" if hint_suffix else slice_str
+                bm25_tokens = build_bm25_tokens(
+                    f"{slice_str} {hint_suffix}".strip(), subject="user", tag=None
+                )
+                pending_raw_chunks.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "parent_msg_id": msg_id,
+                        "seq": seq,
+                        "session_ts": ts,
+                        "kind": "raw_slice",
+                        "subject": "user",
+                        "tag": None,
+                        "display_text": slice_str,
+                        "search_text": search_text,
+                        "embed_input": embed_input,
+                        "bm25_tokens": bm25_tokens,
+                        "event_time_start": ts,
+                        "event_time_end": ts,
+                        "tombstoned": 0,
+                        "vector": [],
+                    }
+                )
+
+        active_batch = [r for r in batch_records if r["tombstoned"] == 0]
+        facts: list[ExtractedFact] = []
+        forget_actions: list[ExtractedForgetAction] = []
+        if active_batch:
+            if len(active_batch) <= 16:
+                try:
+                    raw_ext = await self._invoke_extractor(active_batch, existing_tags)
+                except Exception:
+                    raw_ext = regex_extract_batch(active_batch)
+                facts, forget_actions = sanitize_extraction_result(raw_ext, active_batch)
+            else:
+                windows: list[list[dict[str, Any]]] = []
+                for w_start in range(0, len(active_batch), 12):
+                    s_win = active_batch[w_start : w_start + 12]
+                    s_ro = [
+                        {**m, "read_only": True}
+                        for m in active_batch[max(0, w_start - 2) : w_start]
+                    ]
+                    windows.append(s_ro + s_win)
+                sem = asyncio.Semaphore(4)
+
+                async def _run_win(win_msgs: list[dict[str, Any]]) -> Any:
+                    async with sem:
+                        try:
+                            return await self._invoke_extractor(win_msgs, existing_tags)
+                        except Exception:
+                            writable_only = [
+                                m for m in win_msgs if not m.get("read_only")
+                            ]
+                            return regex_extract_batch(writable_only)
+
+                win_results = await asyncio.gather(*[_run_win(w) for w in windows])
+                for win_msgs, raw_ext in zip(windows, win_results, strict=True):
+                    w_facts, w_forgets = sanitize_extraction_result(raw_ext, win_msgs)
+                    facts.extend(w_facts)
+                    forget_actions.extend(w_forgets)
+
+        # Stage 2 (No DB write lock): Pre-align facts & single batch embed immutable chunks
+        seq_to_rec = {int(r["seq"]): r for r in batch_records}
+        active_seq_set = {int(r["seq"]) for r in active_batch}
+
+        prepared_facts: list[dict[str, Any]] = []
+        for f_idx, fact in enumerate(facts):
+            valid_seqs = [s for s in fact.source_seqs if s in active_seq_set]
+            if not valid_seqs:
+                continue
+            primary_seq = max(valid_seqs)
+            if fact.is_other_person or fact.subject.casefold() != "user":
+                formatted_note = f"【非User本人，系{fact.subject}的信息】{fact.fact_text}"
+            else:
+                formatted_note = fact.fact_text
+            if fact.current_state and fact.current_state not in formatted_note:
+                formatted_note = f"{formatted_note}（{fact.current_state}）"
+            if fact.style_note and fact.style_note not in formatted_note:
+                formatted_note = f"{formatted_note}（风格偏好: {fact.style_note}）"
+
+            primary_rec = seq_to_rec[primary_seq]
+            primary_msg_id = str(primary_rec["msg_id"])
+            primary_session_ts = primary_rec["session_ts"]
+            primary_time_str = str(primary_rec["session_time_str"] or "")
+            ev_start, ev_end = parse_event_date_range(
+                fact.event_date_start,
+                fact.event_date_end,
+                fallback_ts=primary_session_ts,
+            )
+            fact_chunk_id = f"fact:{request.request_id}:{f_idx:04d}"
+            fact_search_text = f"[{fact.subject} | {fact.tag}] {formatted_note}"
+            prepared_facts.append(
+                {
+                    "fact": fact,
+                    "valid_seqs": valid_seqs,
+                    "primary_seq": primary_seq,
+                    "primary_msg_id": primary_msg_id,
+                    "primary_session_ts": primary_session_ts,
+                    "primary_time_str": primary_time_str,
+                    "formatted_note": formatted_note,
+                    "ev_start": ev_start,
+                    "ev_end": ev_end,
+                    "chunk_id": fact_chunk_id,
+                    "embed_input": fact_search_text,
+                    "vector": [],
+                }
+            )
+
+        valid_forgets: list[dict[str, Any]] = []
+        for fa in forget_actions:
+            trig_rec = seq_to_rec.get(fa.trigger_seq)
+            if trig_rec is None or fa.trigger_seq not in active_seq_set:
+                continue
+            if not has_explicit_forget_keyword(str(trig_rec["content"])):
+                continue
+            valid_forgets.append(
+                {
+                    "fa": fa,
+                    "trig_rec": trig_rec,
+                    "target_vec": None,
+                }
+            )
+
+        n_raw = len(pending_raw_chunks)
+        all_embed_inputs: list[str] = [
+            *(c["embed_input"] for c in pending_raw_chunks),
+            *(pf["embed_input"] for pf in prepared_facts),
+        ]
+        forget_embed_indices: list[tuple[int, int]] = []
+        for vf_idx, vf in enumerate(valid_forgets):
+            desc = vf["fa"].target_description
+            if desc:
+                forget_embed_indices.append((vf_idx, len(all_embed_inputs)))
+                all_embed_inputs.append(desc)
+
+        if all_embed_inputs:
+            all_vecs = await self.embedder.embed(all_embed_inputs)
+            for r_idx, c in enumerate(pending_raw_chunks):
+                c["vector"] = all_vecs[r_idx]
+            for pf_idx, pf in enumerate(prepared_facts):
+                pf["vector"] = all_vecs[n_raw + pf_idx]
+            for vf_idx, emb_idx in forget_embed_indices:
+                valid_forgets[vf_idx]["target_vec"] = all_vecs[emb_idx]
+
+        # Stage 3: Short atomic SQLite transaction for state replay & persistence
         with self.store.transaction():
-            last_seq, pending_forget = self.store.get_user_state(request.user_id)
-            inherited_ts = self.store.get_last_session_ts(request.user_id, request.session_id)
-
-            first_msg_auto_tombstone = False
-            if pending_forget == 1:
-                if non_sys_messages[0].role == "assistant":
-                    first_msg_auto_tombstone = True
-                self.store.update_user_state(request.user_id, pending_forget_confirm=0)
-
-            batch_records: list[dict[str, Any]] = []
-            pending_raw_chunks: list[dict[str, Any]] = []
-
-            for idx, msg in enumerate(non_sys_messages):
-                seq = last_seq + idx + 1
-                if msg.timestamp is not None:
-                    ts = normalize_timestamp_to_seconds(msg.timestamp)
-                else:
-                    ts = parse_header_timestamp_seconds(msg.content)
-                    if ts is None:
-                        ts = inherited_ts
-                if ts is not None:
-                    inherited_ts = ts
-
-                time_str = format_session_time_str(ts)
-                speaker = extract_speaker(msg.content, msg.role)
-                msg_id = f"msg:{request.user_id}:{seq}"
-                is_tomb = 1 if (idx == 0 and first_msg_auto_tombstone) else 0
-
+            for rec in batch_records:
                 self.store.insert_parent_message(
-                    msg_id=msg_id,
+                    msg_id=rec["msg_id"],
                     user_id=request.user_id,
                     session_id=request.session_id,
                     request_id=request.request_id,
-                    seq=seq,
-                    role=msg.role,
-                    speaker=speaker,
-                    content=msg.content,
-                    session_ts=ts,
-                    session_time_str=time_str,
+                    seq=rec["seq"],
+                    role=rec["role"],
+                    speaker=rec["speaker"],
+                    content=rec["content"],
+                    session_ts=rec["session_ts"],
+                    session_time_str=rec["session_time_str"],
                     fact_notes="",
-                    tombstoned=is_tomb,
+                    tombstoned=rec["tombstoned"],
                 )
-
-                rec = {
-                    "msg_id": msg_id,
-                    "seq": seq,
-                    "role": msg.role,
-                    "speaker": speaker,
-                    "content": msg.content,
-                    "session_ts": ts,
-                    "session_time_str": time_str,
-                    "tombstoned": is_tomb,
-                }
-                batch_records.append(rec)
-
-                if is_tomb:
-                    continue
-
-                hints = temporal_hints(msg.content, ts * 1000 if ts is not None else None)
-                hint_suffix = ("\n[resolved time: " + "; ".join(hints) + "]") if hints else ""
-                slices = slice_message_content(msg.content)
-                for c_idx, slice_str in enumerate(slices):
-                    chunk_id = f"{msg_id}:raw:{c_idx:04d}"
-                    header = f"[#{seq} | {speaker}" + (f" | {time_str}]" if time_str else "]")
-                    search_text = f"{header} {slice_str}{hint_suffix}"
-                    embed_input = f"{slice_str}{hint_suffix}" if hint_suffix else slice_str
-                    bm25_tokens = build_bm25_tokens(
-                        f"{slice_str} {hint_suffix}".strip(), subject="user", tag=None
-                    )
-                    pending_raw_chunks.append(
-                        {
-                            "chunk_id": chunk_id,
-                            "parent_msg_id": msg_id,
-                            "seq": seq,
-                            "session_ts": ts,
-                            "kind": "raw_slice",
-                            "subject": "user",
-                            "tag": None,
-                            "display_text": slice_str,
-                            "search_text": search_text,
-                            "embed_input": embed_input,
-                            "bm25_tokens": bm25_tokens,
-                            "event_time_start": ts,
-                            "event_time_end": ts,
-                            "tombstoned": 0,
-                        }
-                    )
 
             self.store.update_user_state(
                 request.user_id,
@@ -282,203 +444,215 @@ class MemoryPipeline:
                 pending_forget_confirm=0,
             )
 
-            if pending_raw_chunks:
-                raw_vecs = await self.embedder.embed(
-                    [c["embed_input"] for c in pending_raw_chunks]
+            for c in pending_raw_chunks:
+                self.store.upsert_chunk(
+                    chunk_id=c["chunk_id"],
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    parent_msg_id=c["parent_msg_id"],
+                    seq=c["seq"],
+                    session_ts=c["session_ts"],
+                    kind=c["kind"],
+                    subject=c["subject"],
+                    tag=c["tag"],
+                    display_text=c["display_text"],
+                    search_text=c["search_text"],
+                    bm25_tokens=c["bm25_tokens"],
+                    event_time_start=c["event_time_start"],
+                    event_time_end=c["event_time_end"],
+                    embedding=c["vector"],
+                    tombstoned=c["tombstoned"],
                 )
-                for c, vec in zip(pending_raw_chunks, raw_vecs, strict=True):
+
+            # Build cold-tag registry per subject for Scheme C (literal >= 0.75 or cosine > 0.85)
+            cold_tag_registry: dict[str, dict[str, list[list[float]]]] = {}
+            for pf in prepared_facts:
+                subj = pf["fact"].subject
+                if subj not in cold_tag_registry:
+                    db_cold = self.store.get_active_cold_tag_vectors(request.user_id, subj)
+                    cold_tag_registry[subj] = {
+                        tg: [item["vector"] for item in items if item.get("vector")]
+                        for tg, items in db_cold.items()
+                    }
+
+            # Replay facts and forget_actions in strict causal seq order (seq = 1..N)
+            facts_by_seq: dict[int, list[dict[str, Any]]] = {}
+            for pf in prepared_facts:
+                facts_by_seq.setdefault(int(pf["primary_seq"]), []).append(pf)
+
+            forgets_by_seq: dict[int, list[dict[str, Any]]] = {}
+            for vf in valid_forgets:
+                forgets_by_seq.setdefault(int(vf["fa"].trigger_seq), []).append(vf)
+
+            replay_seqs = sorted(
+                {*active_seq_set, *facts_by_seq.keys(), *forgets_by_seq.keys()}
+            )
+            dirty_timelines: dict[tuple[str, str], tuple[str, int, int | None]] = {}
+            last_batch_seq = int(batch_records[-1]["seq"]) if batch_records else 0
+
+            for cur_seq in replay_seqs:
+                for pf in facts_by_seq.get(cur_seq, []):
+                    fact: ExtractedFact = pf["fact"]
+                    f_vec: list[float] = pf["vector"]
+                    # Cold-tag ('其他/*') literal & semantic merging for non-draft facts
+                    if (
+                        fact.source_tier != "user_draft_fiction"
+                        and fact.tag.startswith("其他/")
+                    ):
+                        subj_map = cold_tag_registry.setdefault(fact.subject, {})
+                        merged_tag: str | None = None
+                        for ex_tag in subj_map:
+                            if _literal_cold_tag_overlap(fact.tag, ex_tag) >= 0.75:
+                                merged_tag = ex_tag
+                                break
+                        if merged_tag is None and f_vec:
+                            best_cos = 0.85
+                            for ex_tag, ex_vecs in subj_map.items():
+                                for ev in ex_vecs:
+                                    sim = cosine_similarity(f_vec, ev)
+                                    if sim > best_cos:
+                                        best_cos = sim
+                                        merged_tag = ex_tag
+                        if merged_tag is not None:
+                            fact.tag = merged_tag
+                        subj_map.setdefault(fact.tag, [])
+                        if f_vec:
+                            subj_map[fact.tag].append(f_vec)
+
+                    for s in pf["valid_seqs"]:
+                        self.store.append_parent_fact_note(
+                            request.user_id, s, pf["formatted_note"]
+                        )
+                        self.store.backfill_raw_slices_for_seq(
+                            request.user_id,
+                            s,
+                            subject=fact.subject,
+                            tag=fact.tag,
+                            event_time_start=pf["ev_start"],
+                            event_time_end=pf["ev_end"],
+                            fact_text=fact.fact_text,
+                            source_tier=fact.source_tier,
+                        )
+
+                    fact_search_text = f"[{fact.subject} | {fact.tag}] {pf['formatted_note']}"
+                    fact_bm25 = build_bm25_tokens(
+                        pf["formatted_note"], subject=fact.subject, tag=fact.tag
+                    )
                     self.store.upsert_chunk(
-                        chunk_id=c["chunk_id"],
+                        chunk_id=pf["chunk_id"],
                         user_id=request.user_id,
                         session_id=request.session_id,
-                        parent_msg_id=c["parent_msg_id"],
-                        seq=c["seq"],
-                        session_ts=c["session_ts"],
-                        kind=c["kind"],
-                        subject=c["subject"],
-                        tag=c["tag"],
-                        display_text=c["display_text"],
-                        search_text=c["search_text"],
-                        bm25_tokens=c["bm25_tokens"],
-                        event_time_start=c["event_time_start"],
-                        event_time_end=c["event_time_end"],
-                        embedding=vec,
-                        tombstoned=c["tombstoned"],
-                    )
-
-            # Step 4: Module B - Batch LLM Governance Extraction with Regex Fallback (F2.2)
-            active_batch = [r for r in batch_records if r["tombstoned"] == 0]
-            existing_tags = self.store.get_active_tags(request.user_id)
-            if active_batch:
-                try:
-                    raw_ext = await self._invoke_extractor(active_batch, existing_tags)
-                except Exception:
-                    raw_ext = regex_extract_batch(active_batch)
-                facts, forget_actions = sanitize_extraction_result(raw_ext, active_batch)
-            else:
-                facts, forget_actions = [], []
-
-            seq_to_rec = {int(r["seq"]): r for r in batch_records}
-            pending_derived_chunks: list[dict[str, Any]] = []
-
-            for f_idx, fact in enumerate(facts):
-                valid_seqs = [s for s in fact.source_seqs if s in seq_to_rec]
-                if not valid_seqs and active_batch:
-                    valid_seqs = [int(active_batch[-1]["seq"])]
-                primary_seq = max(valid_seqs) if valid_seqs else (last_seq + 1)
-
-                if fact.is_other_person or fact.subject.casefold() != "user":
-                    formatted_note = f"【非User本人，系{fact.subject}的信息】{fact.fact_text}"
-                else:
-                    formatted_note = fact.fact_text
-
-                primary_msg_id: str | None = None
-                primary_session_ts: int | None = None
-                primary_time_str = ""
-
-                for s in valid_seqs:
-                    info = self.store.append_parent_fact_note(request.user_id, s, formatted_note)
-                    if info is not None and s == primary_seq:
-                        primary_msg_id, _, primary_session_ts = info
-                    if s in seq_to_rec and s == primary_seq:
-                        primary_msg_id = str(seq_to_rec[s]["msg_id"])
-                        primary_session_ts = seq_to_rec[s]["session_ts"]
-                        primary_time_str = str(seq_to_rec[s]["session_time_str"] or "")
-
-                ev_start, ev_end = parse_event_date_range(
-                    fact.event_date_start,
-                    fact.event_date_end,
-                    fallback_ts=primary_session_ts,
-                )
-
-                for s in valid_seqs:
-                    self.store.backfill_raw_slices_for_seq(
-                        request.user_id,
-                        s,
+                        parent_msg_id=pf["primary_msg_id"],
+                        seq=pf["primary_seq"],
+                        session_ts=pf["primary_session_ts"],
+                        kind="fact_item",
                         subject=fact.subject,
                         tag=fact.tag,
-                        event_time_start=ev_start,
-                        event_time_end=ev_end,
-                        fact_text=fact.fact_text,
-                    )
-
-                fact_chunk_id = f"fact:{request.request_id}:{f_idx:04d}"
-                fact_search_text = f"[{fact.subject} | {fact.tag}] {formatted_note}"
-                fact_bm25 = build_bm25_tokens(
-                    formatted_note, subject=fact.subject, tag=fact.tag
-                )
-                pending_derived_chunks.append(
-                    {
-                        "chunk_id": fact_chunk_id,
-                        "parent_msg_id": primary_msg_id,
-                        "seq": primary_seq,
-                        "session_ts": primary_session_ts,
-                        "kind": "fact_item",
-                        "subject": fact.subject,
-                        "tag": fact.tag,
-                        "display_text": formatted_note,
-                        "search_text": fact_search_text,
-                        "embed_input": fact_search_text,
-                        "bm25_tokens": fact_bm25,
-                        "event_time_start": ev_start,
-                        "event_time_end": ev_end,
-                    }
-                )
-
-                rendered_summary, tl_seq, tl_ts = self.store.upsert_tag_timeline(
-                    user_id=request.user_id,
-                    subject=fact.subject,
-                    tag=fact.tag,
-                    seq=primary_seq,
-                    session_ts=primary_session_ts,
-                    time_str=primary_time_str,
-                    prev_state=fact.prev_state,
-                    current_state=fact.current_state,
-                    update_reason=fact.update_reason,
-                    fact_text=fact.fact_text,
-                )
-                tl_chunk_id = f"tl:{request.user_id}:{fact.subject}:{fact.tag}"
-                tl_bm25 = build_bm25_tokens(
-                    rendered_summary, subject=fact.subject, tag=fact.tag
-                )
-                pending_derived_chunks.append(
-                    {
-                        "chunk_id": tl_chunk_id,
-                        "parent_msg_id": None,
-                        "seq": tl_seq,
-                        "session_ts": tl_ts,
-                        "kind": "timeline_summary",
-                        "subject": fact.subject,
-                        "tag": fact.tag,
-                        "display_text": rendered_summary,
-                        "search_text": rendered_summary,
-                        "embed_input": rendered_summary,
-                        "bm25_tokens": tl_bm25,
-                        "event_time_start": tl_ts,
-                        "event_time_end": tl_ts,
-                    }
-                )
-
-            if pending_derived_chunks:
-                derived_vecs = await self.embedder.embed(
-                    [c["embed_input"] for c in pending_derived_chunks]
-                )
-                for c, vec in zip(pending_derived_chunks, derived_vecs, strict=True):
-                    self.store.upsert_chunk(
-                        chunk_id=c["chunk_id"],
-                        user_id=request.user_id,
-                        session_id=request.session_id,
-                        parent_msg_id=c["parent_msg_id"],
-                        seq=c["seq"],
-                        session_ts=c["session_ts"],
-                        kind=c["kind"],
-                        subject=c["subject"],
-                        tag=c["tag"],
-                        display_text=c["display_text"],
-                        search_text=c["search_text"],
-                        bm25_tokens=c["bm25_tokens"],
-                        event_time_start=c["event_time_start"],
-                        event_time_end=c["event_time_end"],
-                        embedding=vec,
+                        source_tier=fact.source_tier,
+                        display_text=pf["formatted_note"],
+                        search_text=fact_search_text,
+                        bm25_tokens=fact_bm25,
+                        event_time_start=pf["ev_start"],
+                        event_time_end=pf["ev_end"],
+                        embedding=f_vec,
                         tombstoned=0,
                     )
 
-            # Step 5: Execute validated forget_actions (F6, F8.1, F10.2)
-            last_batch_seq = int(batch_records[-1]["seq"]) if batch_records else 0
-            for fa in forget_actions:
-                trig_rec = seq_to_rec.get(fa.trigger_seq)
-                if trig_rec is None:
-                    continue
-                # F8.1 Deterministic explicit forget root validation
-                if not has_explicit_forget_keyword(str(trig_rec["content"])):
-                    continue
+                    # Strict prohibition: user_draft_fiction never enters tag_timelines
+                    if fact.source_tier != "user_draft_fiction":
+                        rendered_summary, tl_seq, tl_ts = self.store.upsert_tag_timeline(
+                            user_id=request.user_id,
+                            subject=fact.subject,
+                            tag=fact.tag,
+                            seq=pf["primary_seq"],
+                            session_ts=pf["primary_session_ts"],
+                            time_str=pf["primary_time_str"],
+                            prev_state=fact.prev_state,
+                            current_state=fact.current_state,
+                            update_reason=fact.update_reason,
+                            fact_text=fact.fact_text,
+                        )
+                        dirty_timelines[(fact.subject, fact.tag)] = (
+                            rendered_summary,
+                            tl_seq,
+                            tl_ts,
+                        )
 
-                batch_to_tomb = list(fa.batch_seqs_to_tombstone)
-                if fa.trigger_seq not in batch_to_tomb:
-                    batch_to_tomb.append(fa.trigger_seq)
-                next_rec = seq_to_rec.get(fa.trigger_seq + 1)
-                if (
-                    next_rec is not None
-                    and next_rec["role"] == "assistant"
-                    and (fa.trigger_seq + 1) not in batch_to_tomb
-                ):
-                    batch_to_tomb.append(fa.trigger_seq + 1)
+                cur_rec = seq_to_rec.get(cur_seq)
+                if cur_rec is not None and cur_rec.get("role") == "assistant":
+                    self.store.propagate_assistant_draft_echo(request.user_id, cur_seq)
 
-                if fa.trigger_seq == last_batch_seq and trig_rec["role"] == "user":
-                    self.store.update_user_state(request.user_id, pending_forget_confirm=1)
+                for vf in forgets_by_seq.get(cur_seq, []):
+                    fa: ExtractedForgetAction = vf["fa"]
+                    trig_rec = vf["trig_rec"]
+                    batch_to_tomb = list(fa.batch_seqs_to_tombstone)
+                    if fa.trigger_seq not in batch_to_tomb:
+                        batch_to_tomb.append(fa.trigger_seq)
+                    next_rec = seq_to_rec.get(fa.trigger_seq + 1)
+                    if (
+                        next_rec is not None
+                        and next_rec["role"] == "assistant"
+                        and (fa.trigger_seq + 1) not in batch_to_tomb
+                    ):
+                        batch_to_tomb.append(fa.trigger_seq + 1)
 
-                target_vec: list[float] | None = None
-                if fa.target_description:
-                    [target_vec] = await self.embedder.embed([fa.target_description])
+                    if fa.trigger_seq == last_batch_seq and trig_rec["role"] == "user":
+                        self.store.update_user_state(
+                            request.user_id, pending_forget_confirm=1
+                        )
 
-                self.store.execute_forget_action(
+                    rebuilt_tls = self.store.execute_forget_action(
+                        user_id=request.user_id,
+                        trigger_seq=fa.trigger_seq,
+                        batch_seqs_to_tombstone=batch_to_tomb,
+                        target_existing_tags=fa.target_existing_tags,
+                        target_keywords=fa.target_keywords,
+                        target_description=fa.target_description,
+                        target_vector=vf["target_vec"],
+                    )
+                    for r_subj, r_tag, r_sum, r_seq, r_ts in rebuilt_tls:
+                        dirty_timelines[(r_subj, r_tag)] = (r_sum, r_seq, r_ts)
+                    # Clear tombstoned tags from cold_tag_registry and dirty_timelines
+                    active_tags_now = set(self.store.get_active_tags(request.user_id))
+                    for (d_subj, d_tag) in list(dirty_timelines.keys()):
+                        if (d_subj, d_tag) not in active_tags_now:
+                            dirty_timelines.pop((d_subj, d_tag), None)
+                    for r_subj, t_map in cold_tag_registry.items():
+                        for r_tag in list(t_map.keys()):
+                            if (r_subj, r_tag) not in active_tags_now:
+                                t_map.pop(r_tag, None)
+
+        # Batch-embed surviving modified timeline_summary chunks OUTSIDE SQLite write transaction
+        tl_items = list(dirty_timelines.items())
+        tl_vecs: list[list[float]] = []
+        if tl_items:
+            tl_vecs = await self.embedder.embed([val[0] for _, val in tl_items])
+
+        with self.store.transaction():
+            for ((subj, tag), (rendered_summary, tl_seq, tl_ts)), vec in zip(
+                tl_items, tl_vecs, strict=True
+            ):
+                tl_chunk_id = f"tl:{request.user_id}:{subj}:{tag}"
+                tl_bm25 = build_bm25_tokens(rendered_summary, subject=subj, tag=tag)
+                tier = "other_person" if subj.casefold() != "user" else "user_direct"
+                self.store.upsert_chunk(
+                    chunk_id=tl_chunk_id,
                     user_id=request.user_id,
-                    trigger_seq=fa.trigger_seq,
-                    batch_seqs_to_tombstone=batch_to_tomb,
-                    target_existing_tags=fa.target_existing_tags,
-                    target_keywords=fa.target_keywords,
-                    target_description=fa.target_description,
-                    target_vector=target_vec,
+                    session_id=request.session_id,
+                    parent_msg_id=None,
+                    seq=tl_seq,
+                    session_ts=tl_ts,
+                    kind="timeline_summary",
+                    subject=subj,
+                    tag=tag,
+                    source_tier=tier,
+                    display_text=rendered_summary,
+                    search_text=rendered_summary,
+                    bm25_tokens=tl_bm25,
+                    event_time_start=tl_ts,
+                    event_time_end=tl_ts,
+                    embedding=vec,
+                    tombstoned=0,
                 )
 
             self.store.record_add_request(
@@ -656,7 +830,7 @@ class MemoryPipeline:
         rrf_norm_map = {cid: val / max_rrf for cid, val in rrf_raw.items()}
         recalled_chunks = [c for c in chunks if str(c["chunk_id"]) in rrf_raw]
 
-        # 4. Module D: Separate timelines vs dialogue/long-doc chunks & restore parents (P0-1)
+        # 4. Module D: Homogeneous (parent_msg_id, source_tier) grouping & on-demand assembly (v2.2)
         latest_tag_map = self.store.get_latest_tag_map(request.user_id)
         parent_ids = [
             str(c["parent_msg_id"])
@@ -664,6 +838,7 @@ class MemoryPipeline:
             if c["kind"] != "timeline_summary" and c["parent_msg_id"]
         ]
         parents_map = self.store.get_parent_messages_by_ids(request.user_id, parent_ids)
+        parent_chunks_map = self.store.get_chunks_for_parents(request.user_id, parent_ids)
 
         timeline_candidates: dict[str, MemoryCandidate] = {}
         dialogue_candidates: dict[str, MemoryCandidate] = {}
@@ -674,6 +849,7 @@ class MemoryPipeline:
             c_rrf = rrf_norm_map.get(cid, 0.0)
             subj = str(c["subject"] or "user")
             tg = str(c["tag"]) if c["tag"] else None
+            source_tier = str(c.get("source_tier") or "user_direct")
 
             if kind == "timeline_summary":
                 is_global = tg == "全局指令/格式约束"
@@ -692,6 +868,7 @@ class MemoryPipeline:
                         "rrf_norm": c_rrf,
                         "is_latest_in_tag": True,
                         "is_global_constraint": is_global,
+                        "source_tier": source_tier,
                     },
                 )
                 continue
@@ -737,6 +914,7 @@ class MemoryPipeline:
                             "rrf_norm": c_rrf,
                             "is_latest_in_tag": is_latest,
                             "is_global_constraint": False,
+                            "source_tier": source_tier,
                         },
                     )
                 continue
@@ -763,31 +941,88 @@ class MemoryPipeline:
                         "rrf_norm": c_rrf,
                         "is_latest_in_tag": is_latest,
                         "is_global_constraint": False,
+                        "source_tier": source_tier,
                     },
                 )
                 continue
 
-            # Normal message (<=3000 chars): deduplicate by parent_msg_id and restore neighbors
-            existing = dialogue_candidates.get(pmid)
+            # Normal message (<=3000 chars): group by homogeneous (pmid, source_tier)
+            group_id = pmid if source_tier == "user_direct" else f"{pmid}:{source_tier}"
+            has_bm25 = cid in bm25_scores
+            existing = dialogue_candidates.get(group_id)
             if existing is not None:
                 if c_rrf > float(existing.metadata["rrf_norm"]):
                     existing.metadata["rrf_norm"] = c_rrf
                     existing.score = c_rrf
+                    best_srch = str(c.get("search_text") or c["display_text"])
+                    f_line = str(existing.metadata.get("fact_line") or "")
+                    if f_line and f_line not in best_srch:
+                        best_srch = f"{best_srch}\n{f_line}"
+                    existing.metadata["rerank_text"] = best_srch[:600]
                 if is_latest:
                     existing.metadata["is_latest_in_tag"] = True
+                if has_bm25:
+                    existing.metadata["bm25_hit"] = True
                 if tg and not existing.tag:
                     existing.tag = tg
                 continue
 
-            prev_nb, next_nb = self.store.get_session_neighbors(
-                request.user_id, str(parent["session_id"]), p_seq
+            # On-demand assembly from child raw_slices & live fact_items of the same source_tier
+            all_p_chunks = parent_chunks_map.get(pmid, [])
+            raw_slices = [ch for ch in all_p_chunks if ch["kind"] == "raw_slice"]
+            live_facts = [
+                ch
+                for ch in all_p_chunks
+                if ch["kind"] == "fact_item"
+                and int(ch["tombstoned"]) == 0
+                and ch["source_tier"] == source_tier
+            ]
+
+            has_tomb_or_mixed = any(
+                int(ch["tombstoned"]) == 1 or ch["source_tier"] != source_tier
+                for ch in raw_slices
             )
+            if not raw_slices or not has_tomb_or_mixed:
+                assembled_body = p_content
+            else:
+                body_parts: list[str] = []
+                for ch in raw_slices:
+                    if ch["source_tier"] != source_tier:
+                        continue
+                    if int(ch["tombstoned"]) == 1:
+                        body_parts.append("[已擦除]")
+                    else:
+                        body_parts.append(str(ch["display_text"]))
+                assembled_body = " ".join(body_parts).strip() or str(c["display_text"])
+
             t_str = str(parent["session_time_str"] or "")
             t_header = f" | {t_str}" if t_str else ""
-            anchor_line = f"[#{p_seq} | {parent['speaker']}{t_header}] {p_content}"
+            if source_tier == "user_draft_fiction":
+                anchor_line = (
+                    f"[#{p_seq} | {parent['speaker']} (用户的虚构创作/文稿草稿){t_header}] "
+                    f"{assembled_body}"
+                )
+            else:
+                anchor_line = f"[#{p_seq} | {parent['speaker']}{t_header}] {assembled_body}"
 
-            fact_notes = str(parent["fact_notes"] or "").strip()
-            fact_line = f"[提炼事实: {fact_notes}]" if fact_notes else ""
+            if live_facts:
+                deduped_notes = list(
+                    dict.fromkeys(
+                        str(f["display_text"])
+                        for f in live_facts
+                        if f.get("display_text") and str(f["display_text"]) != assembled_body
+                    )
+                )
+                notes_str = "；".join(deduped_notes)
+                if notes_str:
+                    if source_tier == "user_draft_fiction":
+                        fact_line = f"[草稿/设定摘要: {notes_str}]"
+                    else:
+                        fact_line = f"[提炼事实: {notes_str}]"
+                else:
+                    fact_line = ""
+            else:
+                fact_line = ""
 
             base_lines = [anchor_line]
             if fact_line:
@@ -795,24 +1030,29 @@ class MemoryPipeline:
             cur_tokens = approximate_tokens("\n".join(base_lines))
 
             prev_line = ""
-            if prev_nb and int(prev_nb["tombstoned"]) == 0:
-                prev_text = str(prev_nb["content"] or "")
-                if len(prev_text) <= NEIGHBOR_MAX_CHARS:
-                    cand_prev = f"[#{prev_nb['seq']} | {prev_nb['speaker']}] {prev_text}"
-                    cost_prev = approximate_tokens(cand_prev)
-                    if cur_tokens + cost_prev <= self.token_budget:
-                        prev_line = cand_prev
-                        cur_tokens += cost_prev
-
             next_line = ""
-            if next_nb and int(next_nb["tombstoned"]) == 0:
-                next_text = str(next_nb["content"] or "")
-                if len(next_text) <= NEIGHBOR_MAX_CHARS:
-                    cand_next = f"[#{next_nb['seq']} | {next_nb['speaker']}] {next_text}"
-                    cost_next = approximate_tokens(cand_next)
-                    if cur_tokens + cost_next <= self.token_budget:
-                        next_line = cand_next
-                        cur_tokens += cost_next
+            # Only inline session neighbors when group_tier == 'user_direct' (§5.4.3)
+            if source_tier == "user_direct":
+                prev_nb, next_nb = self.store.get_session_neighbors(
+                    request.user_id, str(parent["session_id"]), p_seq
+                )
+                if prev_nb and int(prev_nb["tombstoned"]) == 0:
+                    prev_text = str(prev_nb["content"] or "")
+                    if len(prev_text) <= NEIGHBOR_MAX_CHARS:
+                        cand_prev = f"[#{prev_nb['seq']} | {prev_nb['speaker']}] {prev_text}"
+                        cost_prev = approximate_tokens(cand_prev)
+                        if cur_tokens + cost_prev <= self.token_budget:
+                            prev_line = cand_prev
+                            cur_tokens += cost_prev
+
+                if next_nb and int(next_nb["tombstoned"]) == 0:
+                    next_text = str(next_nb["content"] or "")
+                    if len(next_text) <= NEIGHBOR_MAX_CHARS:
+                        cand_next = f"[#{next_nb['seq']} | {next_nb['speaker']}] {next_text}"
+                        cost_next = approximate_tokens(cand_next)
+                        if cur_tokens + cost_next <= self.token_budget:
+                            next_line = cand_next
+                            cur_tokens += cost_next
 
             parts: list[str] = []
             if prev_line:
@@ -824,8 +1064,11 @@ class MemoryPipeline:
                 parts.append(fact_line)
 
             restored_text = "\n".join(parts)
-            dialogue_candidates[pmid] = MemoryCandidate(
-                id=pmid,
+            best_srch = str(c.get("search_text") or c["display_text"])
+            if fact_line and fact_line not in best_srch:
+                best_srch = f"{best_srch}\n{fact_line}"
+            dialogue_candidates[group_id] = MemoryCandidate(
+                id=group_id,
                 content=restored_text,
                 score=c_rrf,
                 created_at=t_str or None,
@@ -840,6 +1083,10 @@ class MemoryPipeline:
                     "rrf_norm": c_rrf,
                     "is_latest_in_tag": is_latest,
                     "is_global_constraint": False,
+                    "source_tier": source_tier,
+                    "bm25_hit": has_bm25,
+                    "fact_line": fact_line,
+                    "rerank_text": best_srch[:600],
                 },
             )
 
@@ -859,7 +1106,10 @@ class MemoryPipeline:
         rerank_succeeded = False
 
         if rerank_pool and not getattr(self.reranker, "is_noop", False):
-            docs_for_rerank = [item.content[:2400] for item in rerank_pool]
+            docs_for_rerank = [
+                str(item.metadata.get("rerank_text") or item.content)[:600]
+                for item in rerank_pool
+            ]
             try:
                 if hasattr(self.reranker, "rerank"):
                     r_scores = await self.reranker.rerank(pure_query, docs_for_rerank)
@@ -881,15 +1131,18 @@ class MemoryPipeline:
             latest_bonus = 0.05 if item.metadata.get("is_latest_in_tag") else 0.0
             if rerank_succeeded:
                 r_prob = rerank_scores_map.get(item.id, 0.0)
+                item.metadata["r_prob"] = r_prob
                 item.score = 0.80 * r_prob + 0.20 * rrf_val + latest_bonus
             else:
+                item.metadata["r_prob"] = rrf_val
                 item.score = rrf_val + latest_bonus
 
-        # 6. Dynamic timeline pinning & top_k / token_budget packing (F4, DESIGN.md:28, 156)
+        # 6. Dynamic timeline relevance gating & D_direct / D_draft bucketing with backfill (v2.2)
         if request.top_k == 1:
             ordered_for_pack = sorted(
                 all_candidates,
                 key=lambda item: (
+                    1 if item.metadata.get("source_tier") != "user_draft_fiction" else 0,
                     item.score,
                     1 if item.kind != "timeline_summary" else 0,
                     int(item.session_ts or 0),
@@ -909,6 +1162,22 @@ class MemoryPipeline:
                 ),
                 reverse=True,
             )
+
+            def _is_tl_eligible(t: MemoryCandidate) -> bool:
+                if t.metadata.get("is_global_constraint"):
+                    return True
+                if rerank_succeeded:
+                    return (
+                        float(t.metadata.get("r_prob", 0.0)) >= TIMELINE_PIN_MIN_SCORE
+                        or t.score >= TIMELINE_PIN_MIN_SCORE + 0.15
+                    ) and t.score >= TIMELINE_PIN_MIN_SCORE
+                return float(t.metadata.get("rrf_norm", 0.0)) >= 0.55
+
+            eligible_tl = [t for t in tl_list if _is_tl_eligible(t)]
+            pinned_tl = eligible_tl[:max_tl]
+            pinned_ids = {t.id for t in pinned_tl}
+            rem_tl = [t for t in tl_list if t.id not in pinned_ids]
+
             dlg_list = sorted(
                 dialogue_candidates.values(),
                 key=lambda item: (
@@ -919,10 +1188,71 @@ class MemoryPipeline:
                 ),
                 reverse=True,
             )
-            pinned_tl = tl_list[:max_tl]
-            pinned_ids = {t.id for t in pinned_tl}
-            rem_tl = [t for t in tl_list if t.id not in pinned_ids]
-            ordered_for_pack = [*pinned_tl, *dlg_list, *rem_tl]
+            d_direct = [
+                d
+                for d in dlg_list
+                if d.metadata.get("source_tier", "user_direct") != "user_draft_fiction"
+            ]
+            d_draft = [
+                d
+                for d in dlg_list
+                if d.metadata.get("source_tier") == "user_draft_fiction"
+                and d.score >= DRAFT_MIN_SCORE
+                and (
+                    not rerank_succeeded
+                    or float(d.metadata.get("r_prob", 0.0)) >= DRAFT_MIN_SCORE
+                )
+            ]
+
+            rem = max(0, request.top_k - len(pinned_tl))
+            n_high = sum(
+                1
+                for d in d_direct
+                if d.score >= DRAFT_FALLBACK_THRESHOLD
+                and (
+                    not rerank_succeeded
+                    or float(d.metadata.get("r_prob", 0.0)) >= DRAFT_FALLBACK_THRESHOLD
+                )
+            )
+
+            if n_high >= rem or not d_draft:
+                selected_dlg = d_direct[:rem]
+                overflow_dlg = [*d_direct[rem:], *d_draft]
+            else:
+                direct_keep = max(n_high, max(0, rem - 2))
+                selected_direct = d_direct[:direct_keep]
+                draft_quota = min(2, max(0, rem - len(selected_direct)))
+                selected_draft = d_draft[:draft_quota]
+                backfill_direct = d_direct[direct_keep:]
+                need_backfill = max(0, rem - len(selected_direct) - len(selected_draft))
+                selected_dlg = [
+                    *selected_direct,
+                    *backfill_direct[:need_backfill],
+                    *selected_draft,
+                ]
+                selected_dlg.sort(
+                    key=lambda item: (
+                        1 if item.metadata.get("bm25_hit") else 0,
+                        1
+                        if item.metadata.get("source_tier") != "user_draft_fiction"
+                        and item.score >= DRAFT_FALLBACK_THRESHOLD
+                        else 0,
+                        item.score,
+                    ),
+                    reverse=True,
+                )
+                overflow_dlg = [
+                    *backfill_direct[need_backfill:],
+                    *d_draft[draft_quota:],
+                ]
+
+            ordered_for_pack = [
+                *selected_dlg[:1],
+                *pinned_tl,
+                *selected_dlg[1:],
+                *overflow_dlg,
+                *rem_tl,
+            ]
 
         packed = pack_results(ordered_for_pack, request.top_k, self.token_budget)
         packed = packed[: request.top_k]

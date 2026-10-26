@@ -353,14 +353,78 @@ def extract_query_time_range(query: str, anchor_ts: int | None = None) -> tuple[
     return None
 
 
+_INCIDENTAL_START_RE = re.compile(
+    r"^\s*(?:顺便说(?:一句|一下)?|顺便提(?:一句|一下|一嘴)?|对了[，,：:\s]|另外提一嘴|另外顺便|"
+    r"by\s+the\s+way\b|btw\b|oh\s+also\b|incidentally\b|speaking\s+of\s+which\b|"
+    r"on\s+another\s+note\b)",
+    re.IGNORECASE,
+)
+
+_INCIDENTAL_INLINE_SPLIT_RE = re.compile(
+    r"(?<=[。！？!?；;，,\s])\s*(?=(?:顺便说(?:一句|一下)?|顺便提(?:一句|一下|一嘴)?|"
+    r"对了[，,：:]|另外提一嘴|另外顺便|"
+    r"by\s+the\s+way\b|btw\b|oh\s+also\b|incidentally\b|speaking\s+of\s+which\b|"
+    r"on\s+another\s+note\b))",
+    re.IGNORECASE,
+)
+
+
+def is_incidental_update_text(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_INCIDENTAL_START_RE.match(text))
+
+
+def _stem_en_word(w: str) -> str | None:
+    if len(w) < 4 or not w.isalpha():
+        return None
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+    if w.endswith("ied") and len(w) > 4:
+        return w[:-3] + "y"
+    if w.endswith("ing") and len(w) >= 5:
+        base = w[:-3]
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        if re.search(r"(?<![aeiou])[aeiou][bcdfghjklmnpqrstvz]$", base) or base.endswith(
+            ("c", "v", "z", "u")
+        ):
+            return base + "e"
+        return base if len(base) >= 3 else None
+    if w.endswith("ed") and len(w) >= 4:
+        base = w[:-2]
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        if re.search(r"(?<![aeiou])[aeiou][bcdfghjklmnpqrstvz]$", base) or base.endswith(
+            ("c", "v", "z", "u")
+        ):
+            return base + "e"
+        return base if len(base) >= 3 else None
+    if w.endswith(("ches", "shes", "xes", "zes", "sses")) and len(w) > 4:
+        return w[:-2]
+    if w.endswith("s") and not w.endswith(("ss", "us", "is")) and len(w) >= 4:
+        return w[:-1]
+    return None
+
+
+_CJK_STOP_CHARS = {"的", "了", "吗", "呢", "吧", "啊", "呀", "着", "过", "什", "么"}
+
+
 def tokenize_bm25(text: str) -> list[str]:
     if not text:
         return []
     lowered = text.casefold()
-    en_words = [
-        w for w in re.findall(r"[a-z0-9_]+", lowered) if w not in _EN_STOPWORDS and len(w) >= 1
+    en_words: list[str] = []
+    for w in re.findall(r"[a-z0-9_]+", lowered):
+        if w in _EN_STOPWORDS or len(w) < 1:
+            continue
+        en_words.append(w)
+        stem = _stem_en_word(w)
+        if stem and stem != w and stem not in _EN_STOPWORDS:
+            en_words.append(stem)
+    cjk_chars = [
+        ch for ch in re.findall(r"[\u3400-\u9fff]", lowered) if ch not in _CJK_STOP_CHARS
     ]
-    cjk_chars = re.findall(r"[\u3400-\u9fff]", lowered)
     cjk_bigrams: list[str] = []
     for run in re.findall(r"[\u3400-\u9fff]{2,}", lowered):
         for i in range(len(run) - 1):
@@ -428,7 +492,15 @@ def slice_message_content(
             start += step
         return slices
 
-    raw_sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    raw_sentences: list[str] = []
+    for base_sent in _SENTENCE_SPLIT_RE.split(text):
+        base_sent = base_sent.strip()
+        if not base_sent:
+            continue
+        for sub_sent in _INCIDENTAL_INLINE_SPLIT_RE.split(base_sent):
+            sub_sent = sub_sent.strip()
+            if sub_sent:
+                raw_sentences.append(sub_sent)
     if not raw_sentences:
         return [text]
 
@@ -445,7 +517,8 @@ def slice_message_content(
                 slices.append(sent[idx : idx + NORMAL_SLICE_MAX_CHARS])
             continue
         if cur_group and (
-            len(cur_group) >= NORMAL_SLICE_SENTENCES
+            is_incidental_update_text(sent)
+            or len(cur_group) >= NORMAL_SLICE_SENTENCES
             or cur_len + len(sent) > NORMAL_SLICE_MAX_CHARS
         ):
             slices.append(" ".join(cur_group))
