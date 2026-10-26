@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import json
 import math
-import re
 import sqlite3
 from array import array
 from collections.abc import Iterator, Sequence
@@ -14,7 +13,13 @@ from typing import Any, Protocol
 import httpx
 
 from .models import MemoryCandidate, WriteItem
-from .text import LONG_DOC_CHAR_THRESHOLD, build_bm25_tokens, tokenize_bm25
+from .text import (
+    LONG_DOC_CHAR_THRESHOLD,
+    build_bm25_tokens,
+    has_explicit_forget_keyword,
+    is_incidental_update_text,
+    tokenize_bm25,
+)
 
 
 class StoreConflictError(RuntimeError):
@@ -173,6 +178,8 @@ class SQLiteStore:
                 kind TEXT NOT NULL,
                 subject TEXT NOT NULL DEFAULT 'user',
                 tag TEXT,
+                source_tier TEXT NOT NULL DEFAULT 'user_direct',
+                context_prefix TEXT DEFAULT '',
                 display_text TEXT NOT NULL,
                 search_text TEXT NOT NULL,
                 bm25_tokens TEXT NOT NULL,
@@ -203,6 +210,19 @@ class SQLiteStore:
             );
             """
         )
+        cols = {
+            str(r["name"])
+            for r in conn.execute("PRAGMA table_info(search_chunks)").fetchall()
+        }
+        if "source_tier" not in cols:
+            conn.execute(
+                "ALTER TABLE search_chunks "
+                "ADD COLUMN source_tier TEXT NOT NULL DEFAULT 'user_direct'"
+            )
+        if "context_prefix" not in cols:
+            conn.execute(
+                "ALTER TABLE search_chunks ADD COLUMN context_prefix TEXT DEFAULT ''"
+            )
         conn.commit()
 
     def check_idempotency(
@@ -379,6 +399,8 @@ class SQLiteStore:
         event_time_start: int | None,
         event_time_end: int | None,
         embedding: Sequence[float],
+        source_tier: str = "user_direct",
+        context_prefix: str = "",
         tombstoned: int = 0,
     ) -> None:
         blob = vector_to_blob(embedding)
@@ -388,10 +410,10 @@ class SQLiteStore:
             """
             INSERT INTO search_chunks (
                 chunk_id, user_id, session_id, parent_msg_id, seq,
-                session_ts, kind, subject, tag, display_text,
-                search_text, bm25_tokens, event_time_start, event_time_end,
+                session_ts, kind, subject, tag, source_tier, context_prefix,
+                display_text, search_text, bm25_tokens, event_time_start, event_time_end,
                 embedding, tombstoned
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chunk_id) DO UPDATE SET
                 session_id = excluded.session_id,
                 parent_msg_id = excluded.parent_msg_id,
@@ -400,6 +422,8 @@ class SQLiteStore:
                 kind = excluded.kind,
                 subject = excluded.subject,
                 tag = excluded.tag,
+                source_tier = excluded.source_tier,
+                context_prefix = excluded.context_prefix,
                 display_text = excluded.display_text,
                 search_text = excluded.search_text,
                 bm25_tokens = excluded.bm25_tokens,
@@ -418,6 +442,8 @@ class SQLiteStore:
                 kind,
                 subject,
                 tag,
+                source_tier,
+                context_prefix,
                 display_text,
                 search_text,
                 bm25_tokens,
@@ -464,24 +490,53 @@ class SQLiteStore:
         event_time_start: int | None,
         event_time_end: int | None,
         fact_text: str = "",
+        source_tier: str = "user_direct",
     ) -> None:
         conn = self._connect()
         rows = conn.execute(
             """
-            SELECT chunk_id, display_text, bm25_tokens, tag
+            SELECT chunk_id, display_text, bm25_tokens, tag, source_tier
             FROM search_chunks
             WHERE user_id = ? AND seq = ? AND kind = 'raw_slice'
+            ORDER BY chunk_id ASC
             """,
             (user_id, seq),
         ).fetchall()
-        for r in rows:
+        if not rows:
+            return
+
+        target_rows = list(rows)
+        if len(rows) > 1:
+            fact_tokens = set(tokenize_bm25(f"{tag} {fact_text}"))
+            scored_rows: list[tuple[int, sqlite3.Row]] = []
+            for r in rows:
+                disp = str(r["display_text"] or "")
+                if source_tier == "user_draft_fiction" and is_incidental_update_text(disp):
+                    scored_rows.append((-1, r))
+                    continue
+                slice_tokens = set(tokenize_bm25(disp))
+                overlap_cnt = len(slice_tokens & fact_tokens)
+                if overlap_cnt == 0 and has_explicit_forget_keyword(disp):
+                    scored_rows.append((-1, r))
+                    continue
+                scored_rows.append((overlap_cnt, r))
+            max_ov = max((sc for sc, _ in scored_rows), default=0)
+            if max_ov > 0:
+                target_rows = [r for sc, r in scored_rows if sc == max_ov]
+            else:
+                target_rows = [r for sc, r in scored_rows if sc >= 0]
+
+        for r in target_rows:
             cid = str(r["chunk_id"])
             disp = str(r["display_text"])
             existing_bm25 = str(r["bm25_tokens"] or "").strip()
             existing_tag = r["tag"]
+            resolved_tier = (
+                "user_direct" if is_incidental_update_text(disp) else source_tier
+            )
             extra_bm25 = build_bm25_tokens(fact_text, subject=subject, tag=tag)
             if existing_tag:
-                # Merge additional fact tokens without overwriting earlier facts on the same seq
+                # Merge additional fact tokens without overwriting earlier facts on the same slice
                 bm25 = f"{existing_bm25} {extra_bm25}".strip()
             else:
                 bm25 = build_bm25_tokens(
@@ -490,12 +545,54 @@ class SQLiteStore:
             conn.execute(
                 """
                 UPDATE search_chunks
-                SET subject = ?, tag = ?, event_time_start = ?, event_time_end = ?,
-                    bm25_tokens = ?
+                SET subject = ?, tag = ?, source_tier = ?,
+                    event_time_start = ?, event_time_end = ?, bm25_tokens = ?
                 WHERE chunk_id = ?
                 """,
-                (subject, tag, event_time_start, event_time_end, bm25, cid),
+                (subject, tag, resolved_tier, event_time_start, event_time_end, bm25, cid),
             )
+        self._maybe_commit()
+
+    def propagate_assistant_draft_echo(self, user_id: str, seq: int) -> None:
+        """If #(seq-1) is a user message whose raw_slices are all 'user_draft_fiction'
+        and #seq (assistant) has no 'user_direct' fact_items, mark #seq raw_slices as
+        'user_draft_fiction' (DESIGN.md §4.2.2.B).
+        """
+        if seq <= 1:
+            return
+        conn = self._connect()
+        prev_parent = conn.execute(
+            "SELECT role, tombstoned FROM parent_messages WHERE user_id = ? AND seq = ?",
+            (user_id, seq - 1),
+        ).fetchone()
+        if (
+            not prev_parent
+            or str(prev_parent["role"]) != "user"
+            or int(prev_parent["tombstoned"]) != 0
+        ):
+            return
+        prev_slices = conn.execute(
+            "SELECT source_tier FROM search_chunks "
+            "WHERE user_id = ? AND seq = ? AND kind = 'raw_slice' AND tombstoned = 0",
+            (user_id, seq - 1),
+        ).fetchall()
+        if not prev_slices or not all(
+            str(r["source_tier"] or "user_direct") == "user_draft_fiction" for r in prev_slices
+        ):
+            return
+        direct_fact = conn.execute(
+            "SELECT 1 FROM search_chunks "
+            "WHERE user_id = ? AND seq = ? AND kind = 'fact_item' "
+            "AND source_tier = 'user_direct' AND tombstoned = 0 LIMIT 1",
+            (user_id, seq),
+        ).fetchone()
+        if direct_fact is not None:
+            return
+        conn.execute(
+            "UPDATE search_chunks SET source_tier = 'user_draft_fiction' "
+            "WHERE user_id = ? AND seq = ? AND kind = 'raw_slice'",
+            (user_id, seq),
+        )
         self._maybe_commit()
 
     def upsert_tag_timeline(
@@ -640,67 +737,189 @@ class SQLiteStore:
         target_keywords: Sequence[str],
         target_description: str,
         target_vector: Sequence[float] | None,
-    ) -> None:
-        all_batch_seqs = list(dict.fromkeys([trigger_seq, *batch_seqs_to_tombstone]))
+    ) -> list[tuple[str, str, str, int, int | None]]:
+        all_batch_seqs = [
+            int(s)
+            for s in dict.fromkeys([trigger_seq, *batch_seqs_to_tombstone])
+            if s is not None and int(s) <= trigger_seq + 1
+        ]
         self.tombstone_seqs(user_id, all_batch_seqs)
 
         tag_set = {t.strip() for t in target_existing_tags if t and t.strip()}
         kw_list = [k.strip() for k in target_keywords if k and len(k.strip()) >= 2]
-        cjk_kws = [k for k in kw_list if re.search(r"[\u3400-\u9fff]{2,}", k)]
         # P1-2: Prefer target_keywords as denominator; fallback to target_description if empty
         kw_terms = set(tokenize_bm25(" ".join(kw_list)))
         desc_terms = set(tokenize_bm25(target_description))
         target_terms = kw_terms if kw_terms else desc_terms
 
+        cjk_kws = [
+            k
+            for k in kw_list
+            if sum(1 for ch in k if "\u3400" <= ch <= "\u9fff")
+            >= (2 if len(kw_list) == 1 else 3)
+        ]
+
+        def _kw_hit(kw: str, lower_text: str, c_terms: set[str]) -> bool:
+            if kw.casefold() in lower_text:
+                return True
+            parts = kw.split()
+            if not parts:
+                return False
+            for part in parts:
+                p_toks = set(tokenize_bm25(part))
+                if not p_toks or not (p_toks & c_terms):
+                    return False
+            return True
+
+        def _lexical_forget_match(text_combined: str) -> bool:
+            if not text_combined:
+                return False
+            lower_text = text_combined.casefold()
+            if cjk_kws and any(kw.casefold() in lower_text for kw in cjk_kws):
+                return True
+            c_terms = set(tokenize_bm25(text_combined))
+            if kw_list:
+                kw_hits = sum(1 for kw in kw_list if _kw_hit(kw, lower_text, c_terms))
+                if len(kw_list) <= 2:
+                    return kw_hits == len(kw_list)
+                if (kw_hits / len(kw_list)) >= 0.35:
+                    return True
+            elif target_terms:
+                matched_terms = target_terms & c_terms
+                if len(target_terms) <= 2:
+                    return len(matched_terms) == len(target_terms)
+                if (len(matched_terms) / len(target_terms)) >= 0.35:
+                    return True
+            return False
+
         conn = self._connect()
-        # 1. Check tag_timelines
+        # 1. Check tag_timelines (respecting seq <= trigger_seq causal boundary)
         tl_rows = conn.execute(
-            "SELECT subject, tag, current_state, rendered_summary FROM tag_timelines "
-            "WHERE user_id = ? AND tombstoned = 0",
+            "SELECT subject, tag, current_state, history_chain, rendered_summary "
+            "FROM tag_timelines WHERE user_id = ? AND tombstoned = 0",
             (user_id,),
         ).fetchall()
         tombstoned_tags: set[tuple[str, str]] = set()
+        reconstructed_tl_cids: set[str] = set()
+        rebuilt_timelines: list[tuple[str, str, str, int, int | None]] = []
         for r in tl_rows:
             subj = str(r["subject"])
             tg = str(r["tag"])
+            is_full_tag_hit = tg in tag_set
             text_combined = f"{tg} {r['current_state']} {r['rendered_summary']}"
-            matched = tg in tag_set or any(
-                kw.casefold() in text_combined.casefold() for kw in cjk_kws
-            )
-            if not matched and kw_list:
-                kw_hits = sum(
-                    1 for kw in kw_list if kw.casefold() in text_combined.casefold()
-                )
-                if (kw_hits / len(kw_list)) >= 0.35:
-                    matched = True
-            if not matched and target_terms:
-                cand_terms = set(tokenize_bm25(text_combined))
-                overlap = len(target_terms & cand_terms) / max(1, len(target_terms))
-                if overlap >= 0.35:
-                    matched = True
+            matched = is_full_tag_hit or _lexical_forget_match(text_combined)
             if matched:
-                tombstoned_tags.add((subj, tg))
-                conn.execute(
-                    "UPDATE tag_timelines SET tombstoned = 1 "
-                    "WHERE user_id = ? AND subject = ? AND tag = ?",
-                    (user_id, subj, tg),
-                )
-                conn.execute(
-                    "UPDATE search_chunks SET tombstoned = 1 "
-                    "WHERE user_id = ? AND kind = 'timeline_summary' "
-                    "AND subject = ? AND tag = ?",
-                    (user_id, subj, tg),
-                )
+                chain: list[dict[str, Any]] = []
+                if r["history_chain"]:
+                    with contextlib.suppress(Exception):
+                        loaded = json.loads(str(r["history_chain"]))
+                        if isinstance(loaded, list):
+                            chain = loaded
+                if is_full_tag_hit:
+                    surviving_chain = [
+                        item for item in chain if int(item.get("seq") or 0) > trigger_seq
+                    ]
+                else:
+                    surviving_chain = []
+                    for item in chain:
+                        item_seq = int(item.get("seq") or 0)
+                        if item_seq > trigger_seq:
+                            surviving_chain.append(item)
+                            continue
+                        node_text = (
+                            f"{item.get('state', '')} {item.get('prev_state', '')} "
+                            f"{item.get('reason', '')} {item.get('fact_text', '')}"
+                        )
+                        if item_seq in all_batch_seqs or _lexical_forget_match(node_text):
+                            continue
+                        surviving_chain.append(item)
+                if not surviving_chain:
+                    tombstoned_tags.add((subj, tg))
+                    conn.execute(
+                        "UPDATE tag_timelines SET tombstoned = 1 "
+                        "WHERE user_id = ? AND subject = ? AND tag = ?",
+                        (user_id, subj, tg),
+                    )
+                    conn.execute(
+                        "UPDATE search_chunks SET tombstoned = 1 "
+                        "WHERE user_id = ? AND kind = 'timeline_summary' "
+                        "AND subject = ? AND tag = ?",
+                        (user_id, subj, tg),
+                    )
+                else:
+                    if is_full_tag_hit:
+                        tombstoned_tags.add((subj, tg))
+                    latest = surviving_chain[-1]
+                    l_seq = int(latest.get("seq") or trigger_seq)
+                    l_ts = (
+                        int(latest["session_ts"])
+                        if latest.get("session_ts") is not None
+                        else None
+                    )
+                    res_curr = str(latest.get("state") or "")
+                    h_parts: list[str] = []
+                    for idx, item in enumerate(surviving_chain):
+                        st = str(item.get("state") or "")
+                        pr = str(item.get("prev_state") or "")
+                        rsn = str(item.get("reason") or "")
+                        ft = str(item.get("fact_text") or "")
+                        t_label = str(item.get("time_str") or f"#{item.get('seq')}")
+                        if idx == 0 and pr and pr not in st:
+                            h_parts.append(f"[早期状态] {pr}")
+                        detail = f"[{t_label}] {st}"
+                        if rsn:
+                            detail += f"（原因: {rsn}）"
+                        if ft and ft not in detail:
+                            detail += f" - {ft}"
+                        h_parts.append(detail)
+                    c_str = " -> ".join(h_parts)
+                    r_sum = (
+                        f"【状态时间线 | 主体: {subj} | 标签: {tg}】"
+                        f"当前最新状态: {res_curr} | 历史演化: {c_str}"
+                    )
+                    conn.execute(
+                        "UPDATE tag_timelines SET latest_seq = ?, latest_session_ts = ?, "
+                        "current_state = ?, history_chain = ?, rendered_summary = ?, "
+                        "tombstoned = 0 WHERE user_id = ? AND subject = ? AND tag = ?",
+                        (
+                            l_seq,
+                            l_ts,
+                            res_curr,
+                            json.dumps(surviving_chain, ensure_ascii=False),
+                            r_sum,
+                            user_id,
+                            subj,
+                            tg,
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE search_chunks SET seq = ?, session_ts = ?, display_text = ?, "
+                        "search_text = ?, bm25_tokens = ?, tombstoned = 0 "
+                        "WHERE user_id = ? AND kind = 'timeline_summary' "
+                        "AND subject = ? AND tag = ?",
+                        (
+                            l_seq,
+                            l_ts,
+                            r_sum,
+                            r_sum,
+                            build_bm25_tokens(r_sum, subject=subj, tag=tg),
+                            user_id,
+                            subj,
+                            tg,
+                        ),
+                    )
+                    reconstructed_tl_cids.add(f"tl:{user_id}:{subj}:{tg}")
+                    rebuilt_timelines.append((subj, tg, r_sum, l_seq, l_ts))
 
-        # 2. Check search_chunks
+        # 2. Check search_chunks with causal boundary seq <= trigger_seq
         chunk_rows = conn.execute(
             """
             SELECT chunk_id, parent_msg_id, seq, kind, subject, tag,
                    display_text, search_text, embedding
             FROM search_chunks
-            WHERE user_id = ? AND tombstoned = 0
+            WHERE user_id = ? AND tombstoned = 0 AND seq <= ?
             """,
-            (user_id,),
+            (user_id, trigger_seq),
         ).fetchall()
 
         matched_chunk_ids: set[str] = set()
@@ -708,6 +927,8 @@ class SQLiteStore:
 
         for r in chunk_rows:
             cid = str(r["chunk_id"])
+            if cid in reconstructed_tl_cids:
+                continue
             pmid = str(r["parent_msg_id"]) if r["parent_msg_id"] else None
             kind = str(r["kind"])
             tg = str(r["tag"]) if r["tag"] else ""
@@ -719,26 +940,20 @@ class SQLiteStore:
             hit = False
             if tg and (tg in tag_set or (subj, tg) in tombstoned_tags):
                 hit = True
-            if not hit and cjk_kws and any(
-                kw.casefold() in combined.casefold() for kw in cjk_kws
-            ):
+            if not hit and _lexical_forget_match(combined):
                 hit = True
-            if not hit and kw_list:
-                kw_hits = sum(
-                    1 for kw in kw_list if kw.casefold() in combined.casefold()
-                )
-                if (kw_hits / len(kw_list)) >= 0.35:
-                    hit = True
-            if not hit and target_terms:
-                c_terms = set(tokenize_bm25(combined))
-                overlap = len(target_terms & c_terms) / max(1, len(target_terms))
-                if overlap >= 0.35:
-                    hit = True
-            # P1-2: Pure cosine >= 0.58 is an independent OR condition even when overlap == 0
+            # P1-2: Pure cosine >= 0.58 is an independent OR condition;
+            # for >=3 keywords, >=1 keyword hit + cosine >= 0.42 confirms hybrid match
             if not hit and target_vector:
                 vec = self._vector_cache.get(cid) or blob_to_vector(r["embedding"])
-                if cosine_similarity(target_vector, vec) >= 0.58:
+                cos_sim = cosine_similarity(target_vector, vec)
+                if cos_sim >= 0.58:
                     hit = True
+                elif cos_sim >= 0.42 and len(kw_list) >= 3:
+                    comb_lower = combined.casefold()
+                    comb_terms = set(tokenize_bm25(combined))
+                    if any(_kw_hit(kw, comb_lower, comb_terms) for kw in kw_list):
+                        hit = True
 
             if hit:
                 matched_chunk_ids.add(cid)
@@ -758,20 +973,29 @@ class SQLiteStore:
                 (cid,),
             )
 
-        # 3. Also check active parent_messages directly
+        # 3. Also check active parent_messages with seq <= trigger_seq
         parent_rows = conn.execute(
-            "SELECT msg_id, seq, content FROM parent_messages "
-            "WHERE user_id = ? AND tombstoned = 0",
-            (user_id,),
+            "SELECT msg_id, seq, role, session_id, content FROM parent_messages "
+            "WHERE user_id = ? AND tombstoned = 0 AND seq <= ? ORDER BY seq ASC",
+            (user_id, trigger_seq),
         ).fetchall()
 
+        tombstoned_user_seqs: set[tuple[str, int]] = set()
         for pr in parent_rows:
             pmid = str(pr["msg_id"])
+            p_seq = int(pr["seq"])
+            p_role = str(pr["role"] or "")
+            p_sid = str(pr["session_id"] or "")
             p_content = str(pr["content"] or "")
-            direct_kw_hit = bool(
-                kw_list and any(kw.casefold() in p_content.casefold() for kw in kw_list)
+            p_lower = p_content.casefold()
+            p_terms = set(tokenize_bm25(p_content))
+            direct_kw_hit = _lexical_forget_match(p_content)
+            paired_assistant_hit = (
+                p_role == "assistant"
+                and (p_sid, p_seq - 1) in tombstoned_user_seqs
+                and bool(kw_list and any(_kw_hit(kw, p_lower, p_terms) for kw in kw_list))
             )
-            if pmid not in affected_parent_ids and not direct_kw_hit:
+            if pmid not in affected_parent_ids and not direct_kw_hit and not paired_assistant_hit:
                 continue
 
             if len(p_content) > LONG_DOC_CHAR_THRESHOLD:
@@ -783,7 +1007,9 @@ class SQLiteStore:
                 if kw_list:
                     new_lines: list[str] = []
                     for line in masked.splitlines(keepends=True):
-                        if any(kw.casefold() in line.casefold() for kw in kw_list):
+                        if _lexical_forget_match(line) or any(
+                            kw.casefold() in line.casefold() for kw in kw_list
+                        ):
                             suffix = "\n" if line.endswith("\n") else ""
                             new_lines.append(f"[已擦除]{suffix}")
                         else:
@@ -796,25 +1022,78 @@ class SQLiteStore:
                     (masked, pmid),
                 )
             else:
-                # Normal parent message <= 3000 chars: tombstone parent and its raw_slice chunks
-                conn.execute(
-                    "UPDATE parent_messages SET tombstoned = 1 WHERE msg_id = ?",
+                # Normal parent message <= 3000 chars: check slice-level surgical tombstoning
+                raw_slices = conn.execute(
+                    "SELECT chunk_id, display_text, tag, tombstoned FROM search_chunks "
+                    "WHERE parent_msg_id = ? AND kind = 'raw_slice' ORDER BY chunk_id ASC",
                     (pmid,),
+                ).fetchall()
+                distinct_tags = {
+                    str(r["tag"])
+                    for r in conn.execute(
+                        "SELECT DISTINCT tag FROM search_chunks "
+                        "WHERE parent_msg_id = ? AND tag IS NOT NULL AND tag != ''",
+                        (pmid,),
+                    ).fetchall()
+                }
+                is_multi_topic = len(distinct_tags) >= 2 or any(
+                    is_incidental_update_text(str(rs["display_text"] or ""))
+                    for rs in raw_slices
                 )
-                conn.execute(
-                    "UPDATE search_chunks SET tombstoned = 1 "
-                    "WHERE parent_msg_id = ? AND kind = 'raw_slice'",
-                    (pmid,),
-                )
+                if len(raw_slices) <= 1 or not is_multi_topic:
+                    conn.execute(
+                        "UPDATE parent_messages SET tombstoned = 1 WHERE msg_id = ?",
+                        (pmid,),
+                    )
+                    conn.execute(
+                        "UPDATE search_chunks SET tombstoned = 1 "
+                        "WHERE parent_msg_id = ? AND kind = 'raw_slice'",
+                        (pmid,),
+                    )
+                    if p_role == "user":
+                        tombstoned_user_seqs.add((p_sid, p_seq))
+                else:
+                    for rs in raw_slices:
+                        if int(rs["tombstoned"]) == 0 and _lexical_forget_match(
+                            str(rs["display_text"] or "")
+                        ):
+                            conn.execute(
+                                "UPDATE search_chunks SET tombstoned = 1 WHERE chunk_id = ?",
+                                (rs["chunk_id"],),
+                            )
+                    counts_row = conn.execute(
+                        "SELECT "
+                        "SUM(CASE WHEN tombstoned = 0 THEN 1 ELSE 0 END) AS active_cnt, "
+                        "SUM(CASE WHEN tombstoned = 1 THEN 1 ELSE 0 END) AS tomb_cnt "
+                        "FROM search_chunks "
+                        "WHERE parent_msg_id = ? AND kind = 'raw_slice'",
+                        (pmid,),
+                    ).fetchone()
+                    active_slice_cnt = int(counts_row["active_cnt"] or 0)
+                    tomb_slice_cnt = int(counts_row["tomb_cnt"] or 0)
+                    if active_slice_cnt == 0 or (direct_kw_hit and tomb_slice_cnt == 0):
+                        conn.execute(
+                            "UPDATE parent_messages SET tombstoned = 1 WHERE msg_id = ?",
+                            (pmid,),
+                        )
+                        conn.execute(
+                            "UPDATE search_chunks SET tombstoned = 1 "
+                            "WHERE parent_msg_id = ? AND kind = 'raw_slice'",
+                            (pmid,),
+                        )
+                        if p_role == "user":
+                            tombstoned_user_seqs.add((p_sid, p_seq))
 
         self._maybe_commit()
+        return rebuilt_timelines
 
     def get_active_chunks(self, user_id: str) -> list[dict[str, Any]]:
         conn = self._connect()
         rows = conn.execute(
             """
             SELECT chunk_id, user_id, session_id, parent_msg_id, seq, session_ts,
-                   kind, subject, tag, display_text, search_text, bm25_tokens,
+                   kind, subject, tag, source_tier, context_prefix,
+                   display_text, search_text, bm25_tokens,
                    event_time_start, event_time_end, embedding
             FROM search_chunks
             WHERE user_id = ? AND tombstoned = 0
@@ -843,6 +1122,8 @@ class SQLiteStore:
                     "kind": str(r["kind"]),
                     "subject": str(r["subject"] or "user"),
                     "tag": str(r["tag"]) if r["tag"] else None,
+                    "source_tier": str(r["source_tier"] or "user_direct"),
+                    "context_prefix": str(r["context_prefix"] or ""),
                     "display_text": str(r["display_text"]),
                     "search_text": str(r["search_text"]),
                     "bm25_tokens": str(r["bm25_tokens"]),
@@ -860,6 +1141,80 @@ class SQLiteStore:
                 }
             )
         return result
+
+    def get_chunks_for_parents(
+        self, user_id: str, parent_msg_ids: Sequence[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        id_list = list(dict.fromkeys(m for m in parent_msg_ids if m))
+        if not id_list:
+            return {}
+        conn = self._connect()
+        out: dict[str, list[dict[str, Any]]] = {}
+        for start in range(0, len(id_list), 500):
+            batch_ids = id_list[start : start + 500]
+            placeholders = ",".join("?" for _ in batch_ids)
+            rows = conn.execute(
+                f"""
+                SELECT chunk_id, parent_msg_id, seq, kind, subject, tag,
+                       source_tier, display_text, tombstoned
+                FROM search_chunks
+                WHERE user_id = ? AND parent_msg_id IN ({placeholders})
+                  AND kind IN ('raw_slice', 'fact_item')
+                ORDER BY chunk_id ASC
+                """,
+                [user_id, *batch_ids],
+            ).fetchall()
+            for r in rows:
+                pmid = str(r["parent_msg_id"])
+                out.setdefault(pmid, []).append(
+                    {
+                        "chunk_id": str(r["chunk_id"]),
+                        "parent_msg_id": pmid,
+                        "seq": int(r["seq"]),
+                        "kind": str(r["kind"]),
+                        "subject": str(r["subject"] or "user"),
+                        "tag": str(r["tag"]) if r["tag"] else None,
+                        "source_tier": str(r["source_tier"] or "user_direct"),
+                        "display_text": str(r["display_text"]),
+                        "tombstoned": int(r["tombstoned"]),
+                    }
+                )
+        return out
+
+    def get_active_cold_tag_vectors(
+        self, user_id: str, subject: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT chunk_id, tag, kind, display_text, embedding
+            FROM search_chunks
+            WHERE user_id = ? AND subject = ? AND tombstoned = 0
+              AND tag LIKE '其他/%' AND kind IN ('fact_item', 'timeline_summary')
+            ORDER BY seq ASC
+            """,
+            (user_id, subject),
+        ).fetchall()
+        out: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            tg = str(r["tag"] or "")
+            if not tg.startswith("其他/"):
+                continue
+            cid = str(r["chunk_id"])
+            vec = self._vector_cache.get(cid)
+            if vec is None:
+                vec = blob_to_vector(r["embedding"])
+                if vec:
+                    self._vector_cache[cid] = vec
+            out.setdefault(tg, []).append(
+                {
+                    "chunk_id": cid,
+                    "kind": str(r["kind"]),
+                    "display_text": str(r["display_text"]),
+                    "vector": vec,
+                }
+            )
+        return out
 
     def get_parent_messages_by_ids(
         self, user_id: str, msg_ids: Sequence[str]

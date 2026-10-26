@@ -1,157 +1,160 @@
-# Dandelion Memory v2 设计文档（v2.1 评审收敛版）
+# Dandelion Memory v2 设计文档（v2.2 统一流水线定稿版）
 
-> **关联 Issue / PR**：`moujunlin/lori-backend#234` · [`dandelion-memory`](file:///home/maomao/dandelion-memory) (`feature/aml-mvp` · PR #2)  
-> **状态**：v2.1（已合入猫猫拍板项与砚首轮评审 `F1–F4, F6–F16`；`F5` 已凭官方评测源码驳回）
-
----
-
-## 1. 终态一句话与解决的核心缺口
-
-一个符合 AML 第二期文本赛道官方契约的同步记忆服务：`/add` 将非 `system` 原始对话落库并切为 2 句细粒度检索块，同时对每个批次全量调用 1 次轻量 LLM 提取**角色映射 (`subject`)、主题状态时间线 (`tag` + 新旧状态 + 改口原因)、折算后的绝对事件时间 (`event_time_start/end`) 及联动遗忘墓碑 (`forget_actions`)**；`/search` 通过**零 LLM 的四路召回（Dense + BM25 标签倍增 + 时间 Range + 选择题 Options 扩展）+ 父级还原内联 + `qwen3-rerank` 精排**，在 `top_k <= 100` 与 `100,000` token 预算内返回证据。
+> **关联 Issue / PR**：`moujunlin/lori-backend#234` · [`dandelion-memory`](file:///home/maomao/dandelion-memory) (`feat/dandelion-v2` · PR #2)  
+> **状态**：v2.2（经真题诊断、砚代码边界挑刺、Codex 对抗性评审及整体架构收敛后的统一流水线版）
 
 ---
 
-## 2. 对外契约与容错边界（解 F1, F2, F4, F5）
+## 1. 核心架构收敛原则（告别补丁式同步）
 
-1. **`Message.role` 与 `system` 过滤（解 F1, 驳回 F5）**：
-   - [`models.py`](file:///home/maomao/dandelion-memory/src/dandelion_memory/models.py) 中 `Message.role` 定义为 `Literal["user", "assistant", "system"]`。
-   - `/add` 接收到 `role == "system"` 的消息时通过校验但不写入检索表（已核实 [`clbench_pipeline.py.txt`](file:///tmp/aml-ds/amlrepo/clbench_pipeline.py.txt#L28-L35)，平台在 `CL-bench` 答题模板顶部直接注入 `{{system_prompt}}`，不依赖检索返回；而过滤 `system` 可彻底阻断 `PersonaMem v2` 首条 3.7k 初始画像泄密）。
-   - 若某次 `/add` 过滤 `system` 后有效消息列表为空，仍将 `(request_id, user_id, session_id, payload_hash)` 写入 `add_requests` 幂等账本，允许空写入正常返回 HTTP 200 `{success: true, request_id, user_id, session_id}`。
-2. **幂等前置（解 F2.1）**：
-   - `/add` 入口第一步计算完整请求的 `payload_hash` 并查询 `add_requests`：
-     - 若 `request_id` 已存在且 `payload_hash` 一致 $\rightarrow$ 立即返回 HTTP 200（**0 次 LLM / Embedding 调用，无重放副作用**）；
-     - 若 `request_id` 已存在但 `payload_hash` 或 `user_id / session_id` 不同 $\rightarrow$ 立即返回 HTTP 409。
-3. **模块 B 全量 LLM 调用的强降级契约（解 F2.2）**：
-   - 每次有效 `/add` 批次全量调用 1 次 LLM（单次超时 `8.0s`，最多重试 1 次，强制 `response_format={"type": "json_object"}` + 逐条容错校验）。
-   - 若 LLM 超时、限流或返回非法 JSON，**严禁抛出 500 阻断写入**：自动降级为确定性正则（[`text.py`](file:///home/maomao/dandelion-memory/src/dandelion_memory/text.py) 的 `extract_forget_target` + `temporal_hints`），确保模块 A 的 `parent_messages` 与 `raw_slice` 100% 完成 Embedding 与 BM25 入库并返回 200。
-4. **动态 `top_k` 与预算截断（解 F4）**：
-   - 置顶状态时间线条数上限为 `max_timelines = min(5, max(1, request.top_k // 5))`（当 `request.top_k == 1` 时最多 0~1 条，优先保最高分项），合并列表严格执行 `packed[:request.top_k]` 且总 token $\le 100,000$。
+v2.1 及初版草案最大的复杂性根源，在于将同一条记忆同时存为 5 份可变副本（`raw_slice`、`fact_item`、可涂改的 `parent_messages.content`、可追加/删行的 `parent_messages.fact_notes`、`tag_timelines`），并在检索时过早将整条父消息与邻居糊成一团送入精排。
+
+v2.2 确立**「单一权威检索单元 + 内存按序状态机 + 检索末段按需组装」**三条铁律：
+1. **父消息只读，检索单元（`search_chunks`）为唯一开关载体**：
+   - `parent_messages.content` 原文永不涂改，**废弃 `parent_messages.fact_notes` 冗余字符串维护**；
+   - 是否被遗忘（`tombstoned`）、属于哪种事实层级（`source_tier`: `'user_direct'` | `'user_draft_fiction'` | `'other_person'`）全部收敛在 `search_chunks`（`raw_slice` 与 `fact_item`）及 `tag_timelines` 上。
+2. **写入侧「外部慢请求前置 $\rightarrow$ 内存按 `seq` 串行重放 $\rightarrow$ 短事务原子落库」**：
+   - 调 LLM 与调 Embedding API 期间**严禁持有 SQLite 写事务锁**；
+   - 所有窗口并发抽取完成后，先对不可变文本（`raw_slice`、`fact_item`、遗忘目标词）一次性批量计算向量，再在内存中按 `seq = 1..N` 严格单线程重放写入与 `seq <= trigger_seq` 遗忘，最后仅对定型的 `timeline_summary` 算一次向量，并在单次毫秒级短事务中落库。
+3. **检索侧「小块精排 $\rightarrow$ 门槛排座 $\rightarrow$ 最终 Top-K 现场按存活切片组装父消息」**：
+   - 送 `qwen3-rerank` 时只送同类型的浓缩子切片 + 存活 `fact_item`（$\le 600$ 字），不拼邻居、不送整篇长文；
+   - 选出最终 Top-K 后，才现场读取父消息下存活且同类型的 `raw_slice` 与 `fact_item` 拼出上下文（若有切片被墓碑化则在该切片位置渲染 `[已擦除]`，若混有小说切片则自动跳过）。
 
 ---
 
-## 3. 单栈数据模型设计（解 F7, F9, F10, F14）
+## 2. 对外契约与容错边界
 
-采纳单栈减法：在 Colab 50GB 实例中使用 **单 SQLite-WAL 数据库 + 内存 Numpy `float32` 向量矩阵 + 内置 BM25**（同时保持 [`store.py`](file:///home/maomao/dandelion-memory/src/dandelion_memory/store.py) 的 `MemoryStore` 协议兼容 Supabase PG `aml` schema），消除 SQLite+Qdrant 跨库同步负担，所有写入与墓碑化在单事务内原子完成。
+1. **`Message.role` 与 `system` 过滤**：
+   - [`models.py`](file:///home/maomao/dandelion-memory/src/dandelion_memory/models.py) 中 `Message.role` 为 `Literal["user", "assistant", "system"]`。
+   - `/add` 忽略 `role == "system"` 的消息（防 `PersonaMem v2` 首条 3.7k 初始画像泄密）；若过滤后有效消息为空，仍记录 `add_requests` 幂等账本并返回 HTTP 200。
+2. **用户级写串行化与幂等前置**：
+   - 按 `user_id` 粒度加异步协程锁（`asyncio.Lock`），防止同一用户并发 `/add` 争抢 `last_seq`；
+   - 入口第一步校验 `add_requests`：同 `request_id` 且同 `payload_hash` 直接返回 HTTP 200（0 次外部调用）；同 `request_id` 但负载不同返回 HTTP 409。
+3. **滑窗并发 LLM 调用的强降级契约**：
+   - 单窗超时 `8.0s`，最多重试 1 次，`Semaphore(4)` 并发控制；
+   - 任一窗口若超时或 JSON 非法，自动降级为确定性规则（[`text.py`](file:///home/maomao/dandelion-memory/src/dandelion_memory/text.py) 的 `extract_forget_target` + `temporal_hints` + 启发式草稿/第三人识别），绝不抛出 500。
 
-### 3.1 `add_requests`（幂等与跨批状态表）
+---
+
+## 3. 单栈数据模型设计（Schema v2.2）
+
+### 3.1 `add_requests`（幂等账本）
 - `request_id` (`TEXT PRIMARY KEY`), `user_id` (`TEXT NOT NULL`), `session_id` (`TEXT NOT NULL`), `payload_hash` (`TEXT NOT NULL`), `created_at` (`TEXT NOT NULL`)
 
-### 3.2 `user_state`（用户级单调序号与跨批次遗忘确认锁，解 F10.2）
+### 3.2 `user_state`（用户级单调序号与跨批遗忘确认锁）
 - `user_id` (`TEXT PRIMARY KEY`)
-- `last_seq` (`INTEGER NOT NULL DEFAULT 0`)：分配该 `user_id` 下全局单调递增的 `seq`
-- `pending_forget_confirm` (`INTEGER NOT NULL DEFAULT 0`)：若上一批次末尾是用户的显式遗忘指令，置为 `1`；下一批次首条若是 `assistant` 确认句则自动标 `tombstoned=1` 并清零。
+- `last_seq` (`INTEGER NOT NULL DEFAULT 0`)
+- `pending_forget_confirm` (`INTEGER NOT NULL DEFAULT 0`)
 
-### 3.3 `parent_messages`（原始消息表，解 F3, F6, F9）
+### 3.3 `parent_messages`（只读原始消息表）
 - `msg_id` (`TEXT PRIMARY KEY`)
 - `user_id` (`TEXT NOT NULL`), `session_id` (`TEXT NOT NULL`), `request_id` (`TEXT NOT NULL`)
-- `seq` (`INTEGER NOT NULL`)：该 `user_id` 下的全局单调序号（`1, 2, ...`）
+- `seq` (`INTEGER NOT NULL`)：配合 `UNIQUE(user_id, seq)` 唯一索引
 - `role` (`TEXT NOT NULL`)：`user` | `assistant`
-- `speaker` (`TEXT NOT NULL`)：若 `content` 头部匹配 `^([A-Z][a-zA-Z0-9_ -]{1,30}):\s+` 则提取为 `speaker`，否则取 `role`（原文保留不删）
-- `content` (`TEXT NOT NULL`)：原始正文（若长文档局部切片被遗忘，对应片段被掩码替换为 `[已擦除]`）
-- `session_ts` (`INTEGER`)：UTC 秒级 Unix 时间戳。若 `message.timestamp`（毫秒）非空则取 `timestamp // 1000`；若为空则尝试从 `content` 头部解析日期锚点，并**在同一 `session_id` / 同一批次内向后继承给无时间戳的后续消息**（解 F9）
-- `session_time_str` (`TEXT`)：格式化后的 UTC 时间串（如 `"2023-05-08 13:56 UTC"`）
-- `fact_notes` (`TEXT DEFAULT ''`)：模块 B 针对该父消息提炼的 `fact_text` 汇总（供模块 D 还原父消息时内联附在末尾，解 F11）
-- `tombstoned` (`INTEGER NOT NULL DEFAULT 0`)
+- `speaker` (`TEXT NOT NULL`)
+- `content` (`TEXT NOT NULL`)：原始未修改正文
+- `session_ts` (`INTEGER`) / `session_time_str` (`TEXT`)
+- `fact_notes` (`TEXT DEFAULT ''`)：保留列以兼容旧表结构，v2.2 不再依赖其作为可变状态源（检索展示时直接由存活的 `fact_item` 动态汇总）
+- `tombstoned` (`INTEGER NOT NULL DEFAULT 0`)：仅当整条消息的所有子切片均被墓碑化（或本身为遗忘指令/AI 确认句）时置为 `1`
 
-### 3.4 `search_chunks`（统一检索单元表：含原文切片、原子事实、时间线摘要，解 F14.2, F15）
-- `chunk_id` (`TEXT PRIMARY KEY`)
-- `user_id` (`TEXT NOT NULL`), `session_id` (`TEXT NOT NULL`)
-- `parent_msg_id` (`TEXT`)：`raw_slice` 与 `fact_item` 指向所属 `parent_messages.msg_id`（跨多条 `source_seqs` 的 `fact_item` 指向最大的那个 `seq` 对应的 `msg_id`）；`timeline_summary` 为 `NULL`
-- `seq` (`INTEGER NOT NULL`)：所属或最新更新的全局序号
-- `session_ts` (`INTEGER`)：所属或最新更新的会话秒级时间戳
+### 3.4 `search_chunks`（统一权威检索单元表）
+- `chunk_id` (`TEXT PRIMARY KEY`)：`raw_slice` 采用 `{msg_id}:raw:{slice_idx:04d}` 保序编码
+- `user_id` (`TEXT NOT NULL`), `session_id` (`TEXT NOT NULL`), `parent_msg_id` (`TEXT`)
+- `seq` (`INTEGER NOT NULL`), `session_ts` (`INTEGER`)
 - `kind` (`TEXT NOT NULL`)：`raw_slice` | `fact_item` | `timeline_summary`
-- `subject` (`TEXT NOT NULL DEFAULT 'user'`)：角色主语（`user` / 具名 NPC / `user的朋友`）
-- `tag` (`TEXT`)：二级主题标签（如 `喜好/音乐`、`全局指令/格式约束`）
+- `subject` (`TEXT NOT NULL DEFAULT 'user'`)
+- `source_tier` (`TEXT NOT NULL DEFAULT 'user_direct'`) **[v2.2 新增]**：
+  - `'user_direct'`：用户直接陈述的现实事实、经历、状态或偏好；
+  - `'user_draft_fiction'`：用户提交的小说/故事/报告草稿，或 AI 顺着草稿润色的回复；
+  - `'other_person'`：归属于朋友、家人、同事等第三人的事实。
+- `tag` (`TEXT`)：二级主题标签
+- `context_prefix` (`TEXT DEFAULT ''`) **[v2.2 新增]**：轻量语境前缀（如 `[#seq | speaker | time | tag]`；若 `source_tier == 'user_draft_fiction'` 且有 `style_note` 则附加 `[文稿折射风格: ...]`）
 - `display_text` (`TEXT NOT NULL`)：检索单元正文
-- `search_text` (`TEXT NOT NULL`)：送 `text-embedding-v4` 的文本
-- `bm25_tokens` (`TEXT NOT NULL`)：分词词元串（`subject` 与 `tag` 词元重复写入 2 次，实现 `TAG_BOOST=2`）
-- `event_time_start` / `event_time_end` (`INTEGER`)：UTC 秒级时间戳区间（LLM 输出的 `YYYY-MM-DD` 统一转为当日 `00:00:00Z` 与 `23:59:59Z` 秒级时间戳；无特定事件时间则回退为 `session_ts`）
-- `embedding` (`BLOB`)：`np.float32` 1024 维向量字节流
+- `search_text` (`TEXT NOT NULL`)：送 `text-embedding-v4` 及 `qwen3-rerank` 的完整检索文本
+- `bm25_tokens` (`TEXT NOT NULL`)：含英文词干还原（Stemming）后的分词词元串
+- `event_time_start` / `event_time_end` (`INTEGER`)
+- `embedding` (`BLOB`)：`np.float32` 1024 维向量（内存 `_vector_cache` 在 `upsert_chunk` 时强制覆盖更新，并在 `tombstoned=1` 时同步剔除缓存项）
 - `tombstoned` (`INTEGER NOT NULL DEFAULT 0`)
 
-### 3.5 `tag_timelines`（角色与主题状态时间线表，解 F7, F8, F14.2）
+### 3.5 `tag_timelines`（角色与主题状态时间线表）
 - `user_id`, `subject`, `tag` (`PRIMARY KEY`)
 - `latest_seq` (`INTEGER NOT NULL`), `latest_session_ts` (`INTEGER`)
 - `current_state` (`TEXT NOT NULL`)
-- `history_chain` (`TEXT NOT NULL`)：JSON 数组 `[{"seq": 12, "session_ts": 1684540800, "time_str": "...", "state": "...", "reason": "..."}]`，**排序规则优先按 `(session_ts, seq)` 升序（若 `session_ts` 非空），否则按 `seq` 升序**（解决 `LongMemEval` 211 题会话时间乱序问题，解 F7）
-- `rendered_summary` (`TEXT NOT NULL`)：每次更新后同步 `UPSERT` 到 `search_chunks`（`kind='timeline_summary'`），直接参与向量与 BM25 检索
+- `history_chain` (`TEXT NOT NULL`)：JSON 数组 `[{"seq": 12, "fact_chunk_id": "...", "session_ts": ..., "time_str": "...", "state": "...", "reason": "..."}]`，按 `(session_ts, seq)` 升序排列
+- `rendered_summary` (`TEXT NOT NULL`)
 - `tombstoned` (`INTEGER NOT NULL DEFAULT 0`)
 
 ---
 
-## 4. 四大模块详细规格（解 F3, F6, F8, F10–F15）
+## 4. 写入链路（`/add`）三阶段单向流水线
 
-### 模块 A：预处理、时间继承与双层切片（[`text.py`](file:///home/maomao/dandelion-memory/src/dandelion_memory/text.py)）
-1. 过滤 `role == "system"`；为每条 `user / assistant` 消息分配该 `user_id` 下递增的 `seq`，解析并向后继承 `session_ts` 与 `speaker`。
-2. 若 `user_state.pending_forget_confirm == 1` 且本批首条为 `assistant` 消息，将其直接标 `tombstoned=1`，随后清零 `pending_forget_confirm`。
-3. **切片粒度**：
-   - 若 `len(content) <= 3000`（普通对话）：按中英文句末标点切句，每 **2 句（或满 300 字符）** 生成一个 `raw_slice`；
-   - 若 `len(content) > 3000`（如 `CL-bench` 长文档/表格）：按段落/换行切成 **800 字符滑窗块（步长 640 字符）**，若首行疑似表头则固定前缀保留。
+### 阶段 1：预处理、切分与并发滑窗抽取（无数据库写锁）
+1. **读取基准状态**：查询 `add_requests` 幂等状态、`user_state(last_seq, pending_forget_confirm)` 及当前活跃 `(subject, tag)` 列表。
+2. **切分 `raw_slice` 与英文词干归一（[`text.py`](file:///home/maomao/dandelion-memory/src/dandelion_memory/text.py)）**：
+   - 过滤 `role == "system"`，为有效消息分配 `seq = last_seq + 1 .. last_seq + M`；
+   - **顺带更新独立成片**：普通消息（$\le 3000$ 字）按句切分（每 2 句或满 300 字一片）；若分句内出现顺带更新引导词（`by the way`、`btw`、`oh also`、`incidentally`、`speaking of which`、`on another note`、`顺便说`、`对了`、`另外提一嘴`），强制在该分句前断开独立成片；
+   - **英文轻量词干还原**：`tokenize_bm25` 对英文词元同时输出原词与词干（`biking -> bike`、`baking -> bake`、`running -> run`、`-ies -> -y`、`-ed`、`-es/-s`）。
+3. **12 轮滑窗并发抽取**：
+   - 若有效消息数 $\le 16$，单次调用 `qwen-flash`；若 $> 16$，按 **12 条可写消息一窗（$S_{\text{win}}$）+ 前序 2 条只读上下文（$S_{\text{ro}}$）** 切分，`Semaphore(4)` 并发调用 `qwen-flash`；
+   - **只读上下文硬隔离**：`sanitize_extraction_result` 仅接受 $S_{\text{win}}$ 内的序号，`seqs = [s for s in raw_seqs if s in S_win]` 为空时直接丢弃该 `fact`（严禁回退绑到窗口末条）；`forget_action` 要求 `trigger_seq in S_win` 且原文含显式遗忘词根。
 
-### 模块 B：写入侧批次记忆治理（每批 `/add` 全量调 1 次 LLM）
-- **输入**：本批非 `system` 消息（带 `#seq`、`speaker`、`session_time_str`）+ 该 `user_id` 当前已有的活跃 `(subject, tag)` 列表。
-- **JSON 输出契约（已修正键名与类型，解 F10）**：
-  ```json
-  {
-    "facts": [
-      {
-        "source_seqs": [14, 15],
-        "subject": "user",
-        "is_other_person": false,
-        "tag": "喜好/音乐",
-        "fact_text": "User 现在的音乐偏好是独立民谣，此前曾喜欢电子音乐，因为觉得电子音乐节太吵而改变偏好",
-        "prev_state": "喜欢电子音乐",
-        "current_state": "喜欢独立民谣",
-        "update_reason": "觉得电子音乐节太吵",
-        "event_date_start": "2023-05-07",
-        "event_date_end": "2023-05-07"
-      }
-    ],
-    "forget_actions": [
-      {
-        "trigger_seq": 18,
-        "target_existing_tags": ["喜好/音乐节"],
-        "target_keywords": ["electronic music festival", "EDM", "rave"],
-        "target_description": "User likes electronic music festivals",
-        "batch_seqs_to_tombstone": [18, 19]
-      }
-    ]
-  }
-  ```
-- **严格治理规则**：
-  1. **防误杀矛盾题（解 F8.1）**：代码层校验 `trigger_seq` 对应的原话必须包含显式遗忘/删除词根（`forget / delete / erase / remove / don't remember / never mention / 忘掉 / 忘记 / 删除 / 别再记得`），否则忽略该条 `forget_action`。普通的改口、纠正、前后矛盾一律走 `facts` 追加到 `tag_timelines.history_chain`，保留新旧两版说法。
-  2. **父子同步闭环墓碑化（解 F6）**：
-     - 本批内的 `batch_seqs_to_tombstone`（含用户遗忘指令及紧跟的 AI 确认句；若 `trigger_seq` 是本批最后一条则置 `pending_forget_confirm=1`）直接标 `tombstoned=1`；
-     - 在该用户历史库中，定位满足以下任一条件的记录：① `tag` 属于 `target_existing_tags`；② 与 `target_keywords` 词项重叠度 $\ge 0.35$（[`pipeline.py:select_for_archive`](file:///home/maomao/dandelion-memory/src/dandelion_memory/pipeline.py#L152-L165)）；③ 与 `target_description` 向量余弦 $\ge 0.58$；
-     - 将命中的 `search_chunks`、`tag_timelines` 标 `tombstoned=1`，并**同步将其所属的 `parent_messages` 标 `tombstoned=1`**（若父消息 `> 3000` 字则仅将对应切片文本替换为 `[已擦除]`），彻底杜绝模块 D 还原父消息或内联邻居时复活泄密。
-  3. **回填与关联（解 F11, F15）**：
-     - 将 `fact` 的 `(subject, tag, event_time_start, event_time_end)` 回填给 `source_seqs` 对应的 `raw_slice`；
-     - 将 `fact_text`（若 `is_other_person=true` 则强制前缀 `【非User本人，系{subject}的信息】`）追加到对应 `parent_messages.fact_notes`；
-     - 若识别到全局回复风格/代码格式要求，固定归入 `tag = "全局指令/格式约束"`（解 F8.2）。
+### 阶段 2：CPU 预对齐 + 不可变文本批量算向量 + 内存按 `seq` 串行状态机重放
+1. **CPU 预对齐与不可变文本一次性 Batch Embedding**：
+   - 先在内存中完成零开销的**切片级 `source_tier` 对齐**（含 `by the way` 等顺带更新词的 `raw_slice` 强制锁为 `'user_direct'`；其余按词干重叠度对齐；纯草稿轮次后的 Assistant 润色回复连坐为 `'user_draft_fiction'`）及 **`其他/*` 字面包含/二元重叠合流（$\ge 0.75$）**，生成最终的 `context_prefix`、`search_text` 与 `bm25_tokens`；
+   - 将本批所有 `raw_slice`、候选 `fact_item` 以及 `forget_action.target_description` 合并为一次批量 `embedder.embed()` 请求，结果存入内存映射，重放中途**0 次网络请求**。
+2. **内存按 `seq` 从小到大单线程串行重放**：
+   - 加载该用户已入库的活跃 `search_chunks` 与 `tag_timelines` 到内存工作集；
+   - 维护 `pending_confirm_seq: int | None`（若初始 `pending_forget_confirm == 1` 且首条为 `assistant`，则 `pending_confirm_seq = first_seq`）；
+   - 按 `seq` 升序遍历本批每条消息：
+     - **A. 检查 AI 遗忘确认句**：若 `seq == pending_confirm_seq` 且 `role == "assistant"`，将该消息及其下属 `raw_slice` 直接标为 `tombstoned=1`，清零 `pending_confirm_seq`，跳过后续处理；
+     - **B. 激活当前 `seq` 的 `raw_slice` 与 `fact_item`**：
+       - **固定 18 类词表 + `其他/*` 向量余弦兜底合流**：若 `fact.tag` 为 `其他/<名词>` 且字面未命中，直接用刚算好的 `fact_item` 向量与工作集中同 `subject` 的已有 `其他/*` 向量算余弦（$> 0.85$ 则合流到已有 `tag` 并刷新 `bm25_tokens`）；
+       - 将当前 `seq` 的 `raw_slice`、`fact_item` 加入内存存活集；**仅当 `fact.source_tier != 'user_draft_fiction'` 时**，将其追加到内存 `tag_timelines[subject, tag].history_chain`（**严禁 `user_draft_fiction` 进入 `tag_timelines`**，防草稿绕过门槛置顶）。
+     - **C. 执行当前 `seq` 触发的遗忘指令（`trigger_seq == seq`）**：
+       - **严格因果边界**：仅在内存存活集中筛选 **`chunk.seq <= trigger_seq`** 的记录；
+       - 匹配条件：① `tag in target_existing_tags`；② 与 `target_keywords` 词干重叠命中（**短分母保护**：若目标词干数 $\le 2$ 则要求全部命中；若 $\ge 3$ 则要求至少命中 2 个不同词干且重叠率 $\ge 0.35$）；③ 与 `target_description` 向量余弦 $\ge 0.58$；
+       - 将命中的 `raw_slice` 与 `fact_item` 标为 `tombstoned=1`；
+       - 从受影响的 `tag_timelines.history_chain` 中移除 `seq <= trigger_seq` 的命中节点（若链变空则标 `tombstoned=1`，否则用剩余最新节点重算 `current_state` 与 `rendered_summary`）；
+       - 将 `#trigger_seq` 自身标 `tombstoned=1`，并设 `pending_confirm_seq = trigger_seq + 1`（若 `trigger_seq` 是整批末条消息，则记 `final_pending_forget_confirm = 1`）。
+3. **最终定型时间线 Embedding**：
+   - 重放结束后，仅收集本批发生新增或被遗忘修改且 `tombstoned == 0` 的 `tag_timelines`，对其最终定型的 `rendered_summary` 批量调用 1 次 `embedder.embed()`。
 
-### 模块 C：Query 侧零 LLM 的四路混合检索（[`pipeline.py`](file:///home/maomao/dandelion-memory/src/dandelion_memory/pipeline.py)，解 F12, F13）
-1. **Query 确定性解析**：
-   - **时间 Range 提取**：基于该用户 `MAX(session_ts)` 为基准时间，用正则提取问题中的年份/年月/具体日期或相对时间词（`yesterday / last week / N days ago / N weeks ago / N months ago`），生成 `[q_time_start, q_time_end]`；
-   - **选择题 `options` 权重拆分（解 F13）**：若 `request.options` 非空，计算 `vec_q = embed(query)` 与 `vec_opt = embed(query + "\n" + "\n".join(opt[:150] for opt in options))`，合成查询向量 `query_vec = normalize(0.7 * vec_q + 0.3 * vec_opt)`；BM25 中 `query` 词元权重为 `2.0`，`options` 独有实词权重为 `0.5`。
-2. **三路打分 + 时间线统一召回（仅在 `tombstoned == 0` 范围）**：
-   - **路 1（Dense 向量，权重 $w_1 = 1.5$）**：Numpy 余弦相似度 Top 150；
-   - **路 2（BM25 稀疏，权重 $w_2 = 1.0$）**：CJK 单双字 Bigram + 英文去停用词 BM25（`k1=1.5, b=0.75`，`subject` 与 `tag` 词元已在入库时 $\times 2$ 倍增）Top 150；
-   - **路 3（时间 Range 过滤通道，权重 $w_3 = 1.2$）**：仅当解析出 `[q_time_start, q_time_end]` 时激活，筛选 `event_time_start <= q_time_end AND event_time_end >= q_time_start` 的子块按余弦相似度取 Top 100（只加分，不裁剪全局候选池，解 F7）；
-   - **加权 RRF 融合公式**：
-     $$\text{RRF}(c) = \sum_{r \in \{1,2,3\}} \frac{w_r}{60 + \text{rank}_r(c)}, \quad \text{rrf\_norm}(c) = \frac{\text{RRF}(c)}{\max_{c'} \text{RRF}(c')}$$
+### 阶段 3：单次毫秒级短事务原子落库
+- 开启 `with self.store.transaction():`，一次性写入 `parent_messages`、`search_chunks`、`tag_timelines`、`user_state` 与 `add_requests`，并同步刷新内存 `_vector_cache`。
 
-### 模块 D：父级聚合（带长文阈值）+ `qwen3-rerank` + 动态打包（解 F3, F4, F11, F12）
-1. **分离时间线与对话块，按粒度去重（解 F3, F14.2）**：
-   - 命中的 `kind == 'timeline_summary'` 加上该用户常驻的 `tag == '全局指令/格式约束'` 归入时间线候选列表；
-   - 其余子块（`raw_slice` / `fact_item`）查看其关联的 `parent_message`：
-     - **普通消息（`len(parent.content) <= 3000`）**：按 `parent_msg_id` 聚合去重（取最高 RRF 分），还原完整父消息正文，内联同 `session_id` 下未墓碑化的 `#(seq-1)` 与 `#(seq+1)`（若邻居 $\le 1000$ 字），并在末尾附上 `parent.fact_notes`（`\n[提炼事实: ...]`，解 F11）；
-     - **超长文档（`len(parent.content) > 3000`，如 `CL-bench`）**：**不还原整条父消息**，直接以命中的 800 字 `raw_slice` 自身为单位去重（解 F3）。
-2. **`qwen3-rerank` 精排与降级（解 F12.2）**：
-   - 取去重后的前 **50 条** 候选送入 DashScope `qwen3-rerank`（每条送审文本截断至最多 `2400` 字符，超时 `4.0s`）；
-   - 综合得分：
-     $$\text{final\_score} = 0.80 \times \text{rerank\_score} + 0.20 \times \text{rrf\_norm} + \mathbb{I}(\text{is\_latest\_in\_tag}) \times 0.05$$
-     其中 `is_latest_in_tag` 按 `(session_ts, seq)` 判定（解 F7）；
-   - 若 Rerank 超时或返回校验失败，自动退回按 `rrf_norm + I(is_latest_in_tag) * 0.05` 排序。
-3. **动态 `top_k` 与 Token 预算打包（解 F4）**：
-   - 先放入得分最高的至多 `min(5, max(1, request.top_k // 5))` 条 `timeline_summary`（当 `request.top_k >= 5` 时）；
-   - 再按 `final_score` 降序依次放入去重后的消息/切片块，严格遵守累计 token $\le 100,000$ 且总返回条数 $\le \text{request.top\_k}$。
+---
+
+## 5. 检索链路（`/search`）四步流水线
+
+### 步骤 1：四路混合粗排（仅限 `tombstoned == 0`）
+- **路 1（Dense 向量，$w_1 = 1.5$）**：Query 向量（若含选择题 `options` 则按 `0.7 * vec_q + 0.3 * vec_opt` 合成）余弦 Top 150；
+- **路 2（词干归一 BM25，$w_2 = 1.0$）**：含英文词干还原的 BM25 Top 150；
+- **路 3（时间 Range 通道，$w_3 = 1.2$）**：时间区间交集 Top 100；
+- 加权 RRF 融合得出每个存活子块的 `rrf_norm`。
+
+### 步骤 2：按 `(parent_msg_id, source_tier)` 同质分组与小块送审 Rerank（Small-to-Big）
+1. **同质证据组聚合（防止小说与真事串味）**：
+   - 非时间线子块按 `(parent_msg_id, source_tier)` 聚合为**同质证据组**（组唯一 ID 设为 `pmid if source_tier == "user_direct" else f"{pmid}:{source_tier}"`；超长文档 `> 3000` 字按 `(chunk_id, source_tier)` 独立成组）；
+   - 这样即使同一条父消息前半段是小说（`user_draft_fiction`）、后半段 `by the way` 是真事（`user_direct`），也会被拆成两个互不干扰的候选组，绝不会让小说借真事的壳混进 `D_direct`。
+2. **浓缩文本送审 `qwen3-rerank`**：
+   - 每个同质证据组的送审文本（`rerank_input`）仅取**该组内得分最高的 1~2 个 `raw_slice.search_text` + 该父消息下同 `source_tier` 且 `tombstoned == 0` 的 `fact_item.display_text`**（总长 $\le 600$ 字，不拼上下游邻居，不送长父消息全文）；
+   - 取前 50 个候选组（含 `timeline_summary`）送入 `qwen3-rerank`，计算综合分：
+     $$\text{base\_score} = 0.80 \times \text{rerank\_score} + 0.20 \times \text{rrf\_norm} + \mathbb{I}(\text{is\_latest\_in\_tag}) \times 0.05$$
+   - 若 `source_tier == 'other_person'` 且 Query 未提及该第三人称呼，则 $\text{final\_score} = \text{base\_score} \times 0.35$；否则 $\text{final\_score} = \text{base\_score}$。
+
+### 步骤 3：相关性门控排座与 `DRAFT_FALLBACK_THRESHOLD` 草稿垫底回填
+1. **时间线相关性门控（防无关时间线霸榜）**：
+   - 仅当 `timeline_summary` 满足 `is_global_constraint == True` 或精排后 `final_score >= 0.40`（无 Rerank 降级时 `rrf_norm >= 0.55`）时，才允许进入置顶队列 `pinned_tl`（至多 `max_tl = min(5, max(1, request.top_k // 5))` 条）；未过线的时间线不予置顶。
+2. **直接事实与草稿分桶排座（可调参数 `DRAFT_FALLBACK_THRESHOLD = 0.55`）**：
+   - 将剩余候选分为**真实直接队列 `D_direct`**（`source_tier != 'user_draft_fiction'`，按 `final_score` 降序）与**及格草稿队列 `D_draft`**（`source_tier == 'user_draft_fiction'` 且 `final_score >= 0.30`，按 `final_score` 降序）；
+   - 设剩余槽位数 `rem = request.top_k - len(pinned_tl)`，统计 `D_direct` 中 `final_score >= DRAFT_FALLBACK_THRESHOLD` 的条数 `n_high`：
+     - 若 `n_high >= rem`（高置信真实记忆已够填满）：全部取 `D_direct[:rem]`；
+     - 若 `n_high < rem` 且 `D_draft` 非空：先保留 `direct_keep = max(n_high, rem - 2)` 条 `selected_direct = D_direct[:direct_keep]`，再取 `selected_draft = D_draft[: min(2, rem - len(selected_direct))]` 放入底部；**若放入草稿后总条数仍不满 `rem`，用剩余的 `D_direct[direct_keep:]` 继续回填补满**。
+
+### 步骤 4：最终入选 Top-K 的按需父消息组装
+- 仅对最终入选 `request.top_k` 的对话证据组 `(parent_msg_id, tier)` 执行上下文展开：
+  1. **组装父消息正文**：查询该 `parent_msg_id` 下所有 `kind == 'raw_slice'`（按 `chunk_id` 序号升序）：
+     - 若所有子切片均满足 `tombstoned == 0` 且 `source_tier == tier`，直接使用 `parent.content` 原文；
+     - 若存在被遗忘（`tombstoned == 1`）或异类 `source_tier` 的子切片，则按顺序拼接：对 `tombstoned == 1` 的切片输出 `[已擦除]`，对 `source_tier != tier` 的切片直接跳过，对匹配的存活切片输出其 `display_text`；
+  2. **组装底部 `[提炼事实]`**：直接读取该 `parent_msg_id` 下所有 `kind == 'fact_item' AND tombstoned == 0 AND source_tier == tier` 的 `display_text` 拼接在末尾；
+  3. **内联上下游邻居**：仅当当前组 `tier == 'user_direct'` 时，内联同 `session_id` 下未墓碑化且非纯草稿的 `#(seq-1)` 与 `#(seq+1)`（若该邻居自身有局部墓碑切片，同样按存活切片渲染）。
