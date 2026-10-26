@@ -693,3 +693,27 @@ def approximate_tokens(text: str) -> int:
     # Conservative enough for the shared 117,760-token input budget, without
     # coupling the service to the Answer model's private tokenizer.
     return max(1, (len(text.encode("utf-8")) + 2) // 3)
+
+
+_MULTI_VAL_TAG_PREFIXES = (
+    "宠物/",
+    "爱好/",
+    "饮食/喜好",
+    "饮食/禁忌",
+    "社交/",
+    "职业/技能",
+    "资产/",
+    "行程/",
+    "全局指令/",
+)
+
+
+def get_base_tag(tag: str | None) -> str:
+    if not tag:
+        return ""
+    return tag.split("#", 1)[0] if "#" in tag else tag
+
+
+def is_naturally_multivalued(tag: str | None) -> bool:
+    base = get_base_tag(tag)
+    return bool(base and base.startswith(_MULTI_VAL_TAG_PREFIXES))

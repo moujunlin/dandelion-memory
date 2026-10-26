@@ -3,9 +3,10 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import re
 import sqlite3
 from array import array
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -16,10 +17,52 @@ from .models import MemoryCandidate, WriteItem
 from .text import (
     LONG_DOC_CHAR_THRESHOLD,
     build_bm25_tokens,
+    get_base_tag,
     has_explicit_forget_keyword,
     is_incidental_update_text,
+    is_naturally_multivalued,
     tokenize_bm25,
 )
+
+_GENERIC_ENTITY_STOP_TOKENS = {
+    "用户", "用", "户", "我", "我的", "那位", "那个", "这只", "那只", "这位",
+    "一个", "一只", "一辆", "一条", "一位", "一家", "一套", "一部", "一台",
+    "一", "个", "只", "辆", "条", "位", "家", "套", "部", "台",
+    "养了", "领养", "买了", "新买", "有一", "拥有", "饲养", "名叫", "叫", "名字", "名为",
+    "养", "领", "买", "新", "有", "名", "在", "做", "是", "的", "了",
+    "今年", "最近", "目前", "现在", "已经", "刚", "又", "还",
+    "user", "my", "the", "a", "an",
+}
+
+_NAMED_ID_RES = (
+    re.compile(r"(?:名叫|名为|叫)\s*([A-Za-z0-9\u4e00-\u9fff]{1,6}?)(?:的|[，,。！!？?\s（(]|$)"),
+    re.compile(
+        r"(?:同学|朋友|同事|校友|室友|闺蜜|导师|老师|搭档)"
+        r"(?!(?:在|是|有|做|的|都|也|今年|最近|目前|现在|发了|升职))"
+        r"([A-Za-z\u4e00-\u9fff]{2,4}?)(?:在|于|[，,。！!？?\s（(]|$)"
+    ),
+)
+
+
+def _extract_named_identifiers(text: str) -> set[str]:
+    names: set[str] = set()
+    for pat in _NAMED_ID_RES:
+        for m in pat.finditer(text):
+            val = m.group(1).strip().casefold()
+            if val and val not in _GENERIC_ENTITY_STOP_TOKENS:
+                names.add(val)
+    return names
+
+
+def _extract_entity_tokens(text: str, base_tag: str) -> set[str]:
+    tag_toks = set(tokenize_bm25(base_tag))
+    all_toks = {
+        t
+        for t in tokenize_bm25(text)
+        if t not in _GENERIC_ENTITY_STOP_TOKENS and t not in tag_toks
+    }
+    multi_char = {t for t in all_toks if len(t) >= 2}
+    return multi_char if multi_char else all_toks
 
 
 class StoreConflictError(RuntimeError):
@@ -97,8 +140,13 @@ class SQLiteStore:
         self._conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._in_tx = False
+        self._active_deadline_check: Callable[[], bool] | None = None
         self._vector_cache: dict[str, list[float]] = {}
         self._init_schema()
+
+    def _check_deadline(self) -> None:
+        if self._active_deadline_check is not None and self._active_deadline_check():
+            raise TimeoutError("Stage 3 operation deadline exceeded")
 
     def _connect(self) -> sqlite3.Connection:
         return self._conn
@@ -108,20 +156,72 @@ class SQLiteStore:
             self._conn.commit()
 
     @contextlib.contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(
+        self, *, deadline_check: Callable[[], bool] | None = None
+    ) -> Iterator[sqlite3.Connection]:
         if self._in_tx:
             yield self._conn
             return
         self._in_tx = True
+        prev_deadline_check = self._active_deadline_check
+        self._active_deadline_check = deadline_check
         cache_snapshot = dict(self._vector_cache)
+        orig_connect = sqlite3.connect
+        store_conn = self._conn
+        target_db = self.db_path
+        if deadline_check is not None:
+            self._conn.set_progress_handler(lambda: 1 if deadline_check() else 0, 1)
+
+        class _TxConnProxy:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(store_conn, name)
+
+            def commit(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+            def __enter__(self) -> _TxConnProxy:
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                return False
+
+        def _tx_connect(database: Any, *args: Any, **kwargs: Any) -> Any:
+            if str(database) == target_db:
+                return _TxConnProxy()
+            return orig_connect(database, *args, **kwargs)
+
+        sqlite3.connect = _tx_connect  # type: ignore[assignment]
         try:
             yield self._conn
+            if deadline_check is not None and deadline_check():
+                raise TimeoutError("Stage 3 transaction deadline exceeded before commit")
             self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            if deadline_check is not None:
+                self._conn.set_progress_handler(None, 0)
+            self._conn.rollback()
+            self._vector_cache = cache_snapshot
+            if "interrupted" in str(exc).lower() or (
+                deadline_check is not None and deadline_check()
+            ):
+                raise TimeoutError(
+                    "Stage 3 SQLite transaction interrupted by deadline"
+                ) from exc
+            raise
         except Exception:
+            if deadline_check is not None:
+                self._conn.set_progress_handler(None, 0)
             self._conn.rollback()
             self._vector_cache = cache_snapshot
             raise
         finally:
+            self._active_deadline_check = prev_deadline_check
+            if deadline_check is not None:
+                self._conn.set_progress_handler(None, 0)
+            sqlite3.connect = orig_connect  # type: ignore[assignment]
             self._in_tx = False
 
     def close(self) -> None:
@@ -200,12 +300,16 @@ class SQLiteStore:
                 user_id TEXT NOT NULL,
                 subject TEXT NOT NULL,
                 tag TEXT NOT NULL,
+                short_id TEXT NOT NULL DEFAULT '',
                 latest_seq INTEGER NOT NULL,
                 latest_session_ts INTEGER,
                 current_state TEXT NOT NULL,
                 history_chain TEXT NOT NULL,
                 rendered_summary TEXT NOT NULL,
+                superseded_seqs TEXT NOT NULL DEFAULT '[]',
+                source_seqs TEXT NOT NULL DEFAULT '[]',
                 tombstoned INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER DEFAULT 0,
                 PRIMARY KEY (user_id, subject, tag)
             );
             """
@@ -223,6 +327,45 @@ class SQLiteStore:
             conn.execute(
                 "ALTER TABLE search_chunks ADD COLUMN context_prefix TEXT DEFAULT ''"
             )
+        tl_cols = {
+            str(r["name"])
+            for r in conn.execute("PRAGMA table_info(tag_timelines)").fetchall()
+        }
+        if "short_id" not in tl_cols:
+            conn.execute(
+                "ALTER TABLE tag_timelines ADD COLUMN short_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "superseded_seqs" not in tl_cols:
+            conn.execute(
+                "ALTER TABLE tag_timelines "
+                "ADD COLUMN superseded_seqs TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "source_seqs" not in tl_cols:
+            conn.execute(
+                "ALTER TABLE tag_timelines "
+                "ADD COLUMN source_seqs TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "updated_at" not in tl_cols:
+            conn.execute(
+                "ALTER TABLE tag_timelines ADD COLUMN updated_at INTEGER DEFAULT 0"
+            )
+        conn.execute(
+            """
+            CREATE VIEW IF NOT EXISTS living_facts AS
+            SELECT
+                user_id,
+                short_id,
+                subject,
+                tag AS key,
+                current_state,
+                latest_seq,
+                latest_session_ts,
+                superseded_seqs,
+                source_seqs
+            FROM tag_timelines
+            WHERE tombstoned = 0
+            """
+        )
         conn.commit()
 
     def check_idempotency(
@@ -277,12 +420,6 @@ class SQLiteStore:
             (user_id,),
         ).fetchone()
         if row is None:
-            conn.execute(
-                "INSERT INTO user_state (user_id, last_seq, pending_forget_confirm) "
-                "VALUES (?, 0, 0)",
-                (user_id,),
-            )
-            self._maybe_commit()
             return 0, 0
         return int(row["last_seq"]), int(row["pending_forget_confirm"])
 
@@ -338,6 +475,48 @@ class SQLiteStore:
             (user_id,),
         ).fetchall()
         return [(str(r["subject"]), str(r["tag"])) for r in rows]
+
+    def _allocate_next_short_id(self, user_id: str) -> str:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT short_id FROM tag_timelines WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        max_idx = 0
+        for r in rows:
+            sid = str(r["short_id"] or "").strip()
+            if sid.startswith("F") and sid[1:].isdigit():
+                max_idx = max(max_idx, int(sid[1:]))
+        return f"F{max_idx + 1}"
+
+    def get_living_facts(self, user_id: str) -> list[dict[str, Any]]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT short_id, subject, tag, current_state, latest_seq, latest_session_ts "
+            "FROM tag_timelines WHERE user_id = ? AND tombstoned = 0 "
+            "ORDER BY latest_seq ASC",
+            (user_id,),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            raw_tag = str(r["tag"])
+            base_key = get_base_tag(raw_tag)
+            out.append(
+                {
+                    "short_id": str(r["short_id"] or ""),
+                    "subject": str(r["subject"]),
+                    "key": base_key,
+                    "tag": raw_tag,
+                    "current_state": str(r["current_state"]),
+                    "latest_seq": int(r["latest_seq"]),
+                    "latest_session_ts": (
+                        int(r["latest_session_ts"])
+                        if r["latest_session_ts"] is not None
+                        else None
+                    ),
+                }
+            )
+        return out
 
     def insert_parent_message(
         self,
@@ -487,15 +666,14 @@ class SQLiteStore:
         *,
         subject: str,
         tag: str,
-        event_time_start: int | None,
-        event_time_end: int | None,
         fact_text: str = "",
         source_tier: str = "user_direct",
+        seq_all_draft: bool = False,
     ) -> None:
         conn = self._connect()
         rows = conn.execute(
             """
-            SELECT chunk_id, display_text, bm25_tokens, tag, source_tier
+            SELECT chunk_id, display_text, bm25_tokens
             FROM search_chunks
             WHERE user_id = ? AND seq = ? AND kind = 'raw_slice'
             ORDER BY chunk_id ASC
@@ -526,31 +704,31 @@ class SQLiteStore:
             else:
                 target_rows = [r for sc, r in scored_rows if sc >= 0]
 
-        for r in target_rows:
+        target_cids = {str(r["chunk_id"]) for r in target_rows}
+        resolved_tier = "user_draft_fiction" if seq_all_draft else "user_direct"
+        extra_bm25 = build_bm25_tokens(fact_text, subject=subject, tag=tag)
+        for r in rows:
             cid = str(r["chunk_id"])
-            disp = str(r["display_text"])
-            existing_bm25 = str(r["bm25_tokens"] or "").strip()
-            existing_tag = r["tag"]
-            resolved_tier = (
-                "user_direct" if is_incidental_update_text(disp) else source_tier
-            )
-            extra_bm25 = build_bm25_tokens(fact_text, subject=subject, tag=tag)
-            if existing_tag:
-                # Merge additional fact tokens without overwriting earlier facts on the same slice
+            if cid in target_cids:
+                existing_bm25 = str(r["bm25_tokens"] or "").strip()
                 bm25 = f"{existing_bm25} {extra_bm25}".strip()
-            else:
-                bm25 = build_bm25_tokens(
-                    f"{disp} {fact_text}".strip(), subject=subject, tag=tag
+                conn.execute(
+                    """
+                    UPDATE search_chunks
+                    SET source_tier = ?, bm25_tokens = ?
+                    WHERE chunk_id = ?
+                    """,
+                    (resolved_tier, bm25, cid),
                 )
-            conn.execute(
-                """
-                UPDATE search_chunks
-                SET subject = ?, tag = ?, source_tier = ?,
-                    event_time_start = ?, event_time_end = ?, bm25_tokens = ?
-                WHERE chunk_id = ?
-                """,
-                (subject, tag, resolved_tier, event_time_start, event_time_end, bm25, cid),
-            )
+            else:
+                conn.execute(
+                    """
+                    UPDATE search_chunks
+                    SET source_tier = ?
+                    WHERE chunk_id = ?
+                    """,
+                    (resolved_tier, cid),
+                )
         self._maybe_commit()
 
     def propagate_assistant_draft_echo(self, user_id: str, seq: int) -> None:
@@ -608,23 +786,204 @@ class SQLiteStore:
         current_state: str,
         update_reason: str,
         fact_text: str,
-    ) -> tuple[str, int, int | None]:
-        conn = self._connect()
-        row = conn.execute(
-            "SELECT history_chain, tombstoned FROM tag_timelines "
-            "WHERE user_id = ? AND subject = ? AND tag = ?",
-            (user_id, subject, tag),
-        ).fetchone()
-        chain: list[dict[str, Any]] = []
-        # P1-1: Only inherit history_chain if existing timeline is NOT tombstoned
-        if row and int(row["tombstoned"]) == 0 and row["history_chain"]:
-            try:
-                loaded = json.loads(str(row["history_chain"]))
-                if isinstance(loaded, list):
-                    chain = loaded
-            except Exception:
-                chain = []
+        op: str = "set",
+        target_id: str | None = None,
+        fact_chunk_id: str | None = None,
+        source_seqs: Sequence[int] | None = None,
+    ) -> tuple[str, int, int | None, str, bool]:
+        def _norm_st(s: str) -> str:
+            return " ".join(s.strip().split()).casefold()
 
+        conn = self._connect()
+        resolved_subject = subject
+        base_tag = get_base_tag(tag)
+        resolved_tag = base_tag
+        row = None
+        preallocated_short_id: str | None = None
+        norm_curr = _norm_st(current_state)
+
+        if target_id:
+            row = conn.execute(
+                "SELECT subject, tag, short_id, history_chain, superseded_seqs, "
+                "source_seqs, current_state, tombstoned FROM tag_timelines "
+                "WHERE user_id = ? AND short_id = ? AND tombstoned = 0",
+                (user_id, target_id),
+            ).fetchone()
+            if row is not None:
+                resolved_subject = str(row["subject"])
+                resolved_tag = str(row["tag"])
+
+        if row is None:
+            sibling_rows = conn.execute(
+                "SELECT subject, tag, short_id, history_chain, superseded_seqs, "
+                "source_seqs, current_state, tombstoned FROM tag_timelines "
+                "WHERE user_id = ? AND subject = ? "
+                "AND (tag = ? OR tag LIKE ? || '#F%') "
+                "ORDER BY latest_seq ASC",
+                (user_id, resolved_subject, base_tag, base_tag),
+            ).fetchall()
+            active_siblings = [r for r in sibling_rows if int(r["tombstoned"]) == 0]
+            exact_match = next(
+                (
+                    r
+                    for r in active_siblings
+                    if _norm_st(str(r["current_state"] or "")) == norm_curr
+                ),
+                None,
+            )
+            if exact_match is not None:
+                row = exact_match
+                resolved_tag = str(exact_match["tag"])
+            elif op == "add" and not (
+                resolved_subject.casefold() != "user"
+                and active_siblings
+                and base_tag
+                in (
+                    "社交/朋友与同事",
+                    "社交/家庭与伴侣",
+                    "居住/地点",
+                    "职业/工作与头衔",
+                )
+            ):
+                base_active = next(
+                    (r for r in active_siblings if str(r["tag"]) == base_tag), None
+                )
+                if base_active is None:
+                    row = next(
+                        (r for r in sibling_rows if str(r["tag"]) == base_tag), None
+                    )
+                    resolved_tag = base_tag
+                else:
+                    preallocated_short_id = self._allocate_next_short_id(user_id)
+                    resolved_tag = f"{base_tag}#{preallocated_short_id}"
+                    row = None
+            else:
+                if not active_siblings:
+                    row = next(
+                        (r for r in sibling_rows if str(r["tag"]) == base_tag), None
+                    )
+                    resolved_tag = base_tag
+                else:
+                    best_row = None
+                    if prev_state:
+                        p_low = prev_state.casefold()
+                        for r in active_siblings:
+                            c_low = str(r["current_state"] or "").casefold()
+                            if c_low and (p_low in c_low or c_low in p_low):
+                                best_row = r
+                                break
+                    q_text_full = f"{prev_state} {current_state} {fact_text}"
+                    q_ent_toks = _extract_entity_tokens(q_text_full, base_tag)
+                    q_all_toks = set(tokenize_bm25(q_text_full))
+                    q_names = _extract_named_identifiers(q_text_full)
+                    sib_ent_tok_sets = [
+                        _extract_entity_tokens(str(r["current_state"] or ""), base_tag)
+                        for r in active_siblings
+                    ]
+                    common_sib_toks = (
+                        set.intersection(*sib_ent_tok_sets)
+                        if len(sib_ent_tok_sets) >= 2 and all(sib_ent_tok_sets)
+                        else set()
+                    )
+                    q_disc_toks = q_ent_toks - common_sib_toks
+
+                    scored_candidates: list[tuple[float, int, sqlite3.Row]] = []
+                    for idx_sib, r in enumerate(active_siblings):
+                        r_text = str(r["current_state"] or "")
+                        r_ent_toks = sib_ent_tok_sets[idx_sib]
+                        r_names = _extract_named_identifiers(r_text)
+                        if q_names and r_names:
+                            ratio = 1.0 if (q_names & r_names) else 0.0
+                        elif not q_names and r_names and any(
+                            nm in q_text_full.casefold() for nm in r_names
+                        ):
+                            ratio = 1.0
+                        elif q_disc_toks and r_ent_toks:
+                            r_disc_toks = r_ent_toks - common_sib_toks
+                            if not q_names and r_names:
+                                name_chars = {ch for nm in r_names for ch in nm}
+                                stripped_disc = {
+                                    t
+                                    for t in r_disc_toks
+                                    if not any(ch in t for ch in name_chars)
+                                }
+                                if stripped_disc:
+                                    r_disc_toks = stripped_disc
+                            if r_disc_toks:
+                                ov_ent = len(q_disc_toks & r_disc_toks)
+                                ratio = ov_ent / max(1, min(len(q_disc_toks), len(r_disc_toks)))
+                            else:
+                                ratio = 0.0
+                        else:
+                            r_all_toks = set(tokenize_bm25(r_text))
+                            ov_all = len(q_all_toks & r_all_toks)
+                            ratio = (
+                                0.0
+                                if is_naturally_multivalued(base_tag)
+                                else ov_all / max(1, min(len(q_all_toks), len(r_all_toks)))
+                            )
+                        scored_candidates.append((ratio, -idx_sib, r))
+                    scored_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                    best_ov_ratio = scored_candidates[0][0] if scored_candidates else 0.0
+                    second_ov_ratio = (
+                        scored_candidates[1][0] if len(scored_candidates) >= 2 else 0.0
+                    )
+                    if best_row is None and scored_candidates and best_ov_ratio > 0.0:
+                        best_row = scored_candidates[0][2]
+                    is_ambiguous = (
+                        len(scored_candidates) >= 2
+                        and (best_ov_ratio - second_ov_ratio) < 0.20
+                    )
+                    if (
+                        not prev_state
+                        and is_naturally_multivalued(base_tag)
+                        and (best_ov_ratio < 0.45 or is_ambiguous)
+                    ):
+                        preallocated_short_id = self._allocate_next_short_id(user_id)
+                        resolved_tag = f"{base_tag}#{preallocated_short_id}"
+                        row = None
+                    else:
+                        row = best_row or active_siblings[-1]
+                        resolved_tag = str(row["tag"])
+
+        if row is not None and int(row["tombstoned"]) == 0 and str(row["short_id"] or ""):
+            short_id = str(row["short_id"])
+        elif preallocated_short_id is not None:
+            short_id = preallocated_short_id
+        else:
+            short_id = self._allocate_next_short_id(user_id)
+
+        chain: list[dict[str, Any]] = []
+        old_source_seqs: list[int] = []
+        old_sup_seqs: list[int] = []
+        # P1-1: Only inherit history_chain if existing timeline is NOT tombstoned
+        if row and int(row["tombstoned"]) == 0:
+            if row["history_chain"]:
+                with contextlib.suppress(Exception):
+                    loaded = json.loads(str(row["history_chain"]))
+                    if isinstance(loaded, list):
+                        chain = loaded
+            if row["source_seqs"]:
+                with contextlib.suppress(Exception):
+                    loaded_src = json.loads(str(row["source_seqs"]))
+                    if isinstance(loaded_src, list):
+                        old_source_seqs = [int(x) for x in loaded_src if x is not None]
+            if row["superseded_seqs"]:
+                with contextlib.suppress(Exception):
+                    loaded_sup = json.loads(str(row["superseded_seqs"]))
+                    if isinstance(loaded_sup, list):
+                        old_sup_seqs = [int(x) for x in loaded_sup if x is not None]
+
+        is_idempotent_repeat = bool(
+            row is not None
+            and int(row["tombstoned"]) == 0
+            and chain
+            and _norm_st(str(row["current_state"] or "")) == norm_curr
+        )
+
+        entry_src_seqs = sorted(
+            {int(s) for s in (source_seqs or [seq]) if s is not None} | {seq}
+        )
         entry: dict[str, Any] = {
             "seq": seq,
             "session_ts": session_ts,
@@ -633,14 +992,24 @@ class SQLiteStore:
             "prev_state": prev_state,
             "reason": update_reason,
             "fact_text": fact_text,
+            "source_seqs": entry_src_seqs,
         }
         replaced = False
         for idx, existing in enumerate(chain):
-            if int(existing.get("seq", -1)) == seq and existing.get("state") == current_state:
+            if int(existing.get("seq", -1)) == seq:
+                prev_n_seqs = [
+                    int(s)
+                    for s in (
+                        existing.get("source_seqs")
+                        or ([existing.get("seq")] if existing.get("seq") is not None else [])
+                    )
+                    if s is not None
+                ]
+                entry["source_seqs"] = sorted(set(prev_n_seqs) | set(entry_src_seqs))
                 chain[idx] = entry
                 replaced = True
                 break
-        if not replaced:
+        if not replaced and not is_idempotent_repeat:
             chain.append(entry)
 
         def _sort_key(item: dict[str, Any]) -> tuple[int, int, int]:
@@ -652,15 +1021,59 @@ class SQLiteStore:
 
         chain.sort(key=_sort_key)
         latest = chain[-1]
+        if is_idempotent_repeat:
+            prev_l_seqs = [
+                int(s)
+                for s in (
+                    latest.get("source_seqs")
+                    or ([latest.get("seq")] if latest.get("seq") is not None else [])
+                )
+                if s is not None
+            ]
+            latest["source_seqs"] = sorted(set(prev_l_seqs) | set(old_source_seqs) | {seq})
+        elif not latest.get("source_seqs"):
+            latest["source_seqs"] = [int(latest.get("seq") or seq)]
+
         latest_seq = int(latest.get("seq") or seq)
         latest_ts = (
             int(latest["session_ts"]) if latest.get("session_ts") is not None else None
         )
         resolved_current_state = str(latest.get("state") or current_state)
 
+        chain_seqs: list[int] = []
+        for item in chain:
+            for s in item.get("source_seqs") or (
+                [item.get("seq")] if item.get("seq") is not None else []
+            ):
+                if s is not None:
+                    chain_seqs.append(int(s))
+        all_known_seqs = sorted(
+            set(old_sup_seqs) | set(old_source_seqs) | set(chain_seqs) | {seq}
+        )
+        is_generic_bucket = (
+            resolved_tag in ("日常/事实", "日常/生活", "常规/事实") and not prev_state
+        )
+        if is_generic_bucket:
+            sup_seqs = []
+            src_seqs = all_known_seqs or [latest_seq]
+        elif is_idempotent_repeat or latest_seq == seq:
+            src_seqs = sorted(set(latest["source_seqs"]))
+            sup_seqs = sorted(s for s in all_known_seqs if s not in src_seqs)
+        else:
+            latest["source_seqs"] = sorted(
+                set(latest["source_seqs"]) | set(old_source_seqs) | {latest_seq}
+            )
+            src_seqs = latest["source_seqs"]
+            sup_seqs = sorted(s for s in all_known_seqs if s not in src_seqs)
+
         history_parts: list[str] = []
+        prev_norm_rendered: str | None = None
         for idx, item in enumerate(chain):
             st = str(item.get("state") or "")
+            cur_norm = _norm_st(st)
+            if prev_norm_rendered is not None and cur_norm == prev_norm_rendered:
+                continue
+            prev_norm_rendered = cur_norm
             pr = str(item.get("prev_state") or "")
             rsn = str(item.get("reason") or "")
             ft = str(item.get("fact_text") or "")
@@ -674,40 +1087,51 @@ class SQLiteStore:
                 detail += f" - {ft}"
             history_parts.append(detail)
 
+        display_tag = get_base_tag(resolved_tag)
         chain_str = " -> ".join(history_parts)
         rendered_summary = (
-            f"【状态时间线 | 主体: {subject} | 标签: {tag}】"
+            f"【状态时间线 | 主体: {resolved_subject} | 标签: {display_tag}】"
             f"当前最新状态: {resolved_current_state} | 历史演化: {chain_str}"
         )
         history_json = json.dumps(chain, ensure_ascii=False)
+        sup_json = json.dumps(sup_seqs, ensure_ascii=False)
+        src_json = json.dumps(src_seqs, ensure_ascii=False)
 
         conn.execute(
             """
             INSERT INTO tag_timelines (
-                user_id, subject, tag, latest_seq, latest_session_ts,
-                current_state, history_chain, rendered_summary, tombstoned
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                user_id, subject, tag, short_id, latest_seq, latest_session_ts,
+                current_state, history_chain, rendered_summary,
+                superseded_seqs, source_seqs, tombstoned
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(user_id, subject, tag) DO UPDATE SET
+                short_id = excluded.short_id,
                 latest_seq = excluded.latest_seq,
                 latest_session_ts = excluded.latest_session_ts,
                 current_state = excluded.current_state,
                 history_chain = excluded.history_chain,
                 rendered_summary = excluded.rendered_summary,
+                superseded_seqs = excluded.superseded_seqs,
+                source_seqs = excluded.source_seqs,
                 tombstoned = 0
             """,
             (
                 user_id,
-                subject,
-                tag,
+                resolved_subject,
+                resolved_tag,
+                short_id,
                 latest_seq,
                 latest_ts,
                 resolved_current_state,
                 history_json,
                 rendered_summary,
+                sup_json,
+                src_json,
             ),
         )
         self._maybe_commit()
-        return rendered_summary, latest_seq, latest_ts
+        is_fact_tombstoned = seq in sup_seqs
+        return rendered_summary, latest_seq, latest_ts, resolved_tag, is_fact_tombstoned
 
     def tombstone_seqs(self, user_id: str, seqs: Sequence[int]) -> None:
         seq_list = [int(s) for s in seqs if s is not None]
@@ -737,13 +1161,16 @@ class SQLiteStore:
         target_keywords: Sequence[str],
         target_description: str,
         target_vector: Sequence[float] | None,
+        target_id: str | None = None,
     ) -> list[tuple[str, str, str, int, int | None]]:
+        self._check_deadline()
         all_batch_seqs = [
             int(s)
             for s in dict.fromkeys([trigger_seq, *batch_seqs_to_tombstone])
             if s is not None and int(s) <= trigger_seq + 1
         ]
         self.tombstone_seqs(user_id, all_batch_seqs)
+        self._check_deadline()
 
         tag_set = {t.strip() for t in target_existing_tags if t and t.strip()}
         kw_list = [k.strip() for k in target_keywords if k and len(k.strip()) >= 2]
@@ -766,6 +1193,10 @@ class SQLiteStore:
             if not parts:
                 return False
             for part in parts:
+                if part.casefold() in lower_text:
+                    continue
+                if any("\u3400" <= ch <= "\u9fff" for ch in part):
+                    return False
                 p_toks = set(tokenize_bm25(part))
                 if not p_toks or not (p_toks & c_terms):
                     return False
@@ -795,18 +1226,28 @@ class SQLiteStore:
         conn = self._connect()
         # 1. Check tag_timelines (respecting seq <= trigger_seq causal boundary)
         tl_rows = conn.execute(
-            "SELECT subject, tag, current_state, history_chain, rendered_summary "
+            "SELECT subject, tag, short_id, current_state, history_chain, rendered_summary "
             "FROM tag_timelines WHERE user_id = ? AND tombstoned = 0",
             (user_id,),
         ).fetchall()
         tombstoned_tags: set[tuple[str, str]] = set()
+        rolled_back_surviving_seqs: dict[tuple[str, str], set[int]] = {}
         reconstructed_tl_cids: set[str] = set()
         rebuilt_timelines: list[tuple[str, str, str, int, int | None]] = []
         for r in tl_rows:
+            self._check_deadline()
             subj = str(r["subject"])
             tg = str(r["tag"])
-            is_full_tag_hit = tg in tag_set
-            text_combined = f"{tg} {r['current_state']} {r['rendered_summary']}"
+            sid = str(r["short_id"] or "")
+            base_tg = get_base_tag(tg)
+            self._check_deadline()
+            is_target_id_hit = bool(target_id and sid == target_id)
+            is_full_tag_hit = (
+                is_target_id_hit
+                or (tg in tag_set)
+                or (base_tg in tag_set and not target_id)
+            )
+            text_combined = f"{base_tg} {r['current_state']} {r['rendered_summary']}"
             matched = is_full_tag_hit or _lexical_forget_match(text_combined)
             if matched:
                 chain: list[dict[str, Any]] = []
@@ -815,24 +1256,48 @@ class SQLiteStore:
                         loaded = json.loads(str(r["history_chain"]))
                         if isinstance(loaded, list):
                             chain = loaded
-                if is_full_tag_hit:
+                node_filtered_chain: list[dict[str, Any]] = []
+                any_node_matched = False
+                for item in chain:
+                    self._check_deadline()
+                    raw_n_seqs = item.get("source_seqs") or (
+                        [item.get("seq")] if item.get("seq") is not None else []
+                    )
+                    node_seqs = [int(s) for s in raw_n_seqs if s is not None]
+                    item_seq = int(item.get("seq") or (node_seqs[-1] if node_seqs else 0))
+                    if item_seq > trigger_seq and all(s > trigger_seq for s in node_seqs):
+                        node_filtered_chain.append(item)
+                        continue
+                    node_text = (
+                        f"{item.get('state', '')} {item.get('prev_state', '')} "
+                        f"{item.get('reason', '')} {item.get('fact_text', '')}"
+                    )
+                    if _lexical_forget_match(node_text):
+                        any_node_matched = True
+                        continue
+                    rem_node_seqs = [
+                        s for s in node_seqs if not (s in all_batch_seqs and s <= trigger_seq)
+                    ]
+                    if len(rem_node_seqs) < len(node_seqs):
+                        any_node_matched = True
+                    if not rem_node_seqs:
+                        continue
+                    updated_item = dict(item)
+                    updated_item["source_seqs"] = rem_node_seqs
+                    updated_item["seq"] = max(rem_node_seqs)
+                    node_filtered_chain.append(updated_item)
+
+                if is_full_tag_hit and not any_node_matched:
                     surviving_chain = [
                         item for item in chain if int(item.get("seq") or 0) > trigger_seq
                     ]
+                    partial_rollback = False
                 else:
-                    surviving_chain = []
-                    for item in chain:
-                        item_seq = int(item.get("seq") or 0)
-                        if item_seq > trigger_seq:
-                            surviving_chain.append(item)
-                            continue
-                        node_text = (
-                            f"{item.get('state', '')} {item.get('prev_state', '')} "
-                            f"{item.get('reason', '')} {item.get('fact_text', '')}"
-                        )
-                        if item_seq in all_batch_seqs or _lexical_forget_match(node_text):
-                            continue
-                        surviving_chain.append(item)
+                    surviving_chain = node_filtered_chain
+                    partial_rollback = any(
+                        int(item.get("seq") or 0) <= trigger_seq for item in surviving_chain
+                    )
+
                 if not surviving_chain:
                     tombstoned_tags.add((subj, tg))
                     conn.execute(
@@ -847,16 +1312,46 @@ class SQLiteStore:
                         (user_id, subj, tg),
                     )
                 else:
-                    if is_full_tag_hit:
+                    if is_full_tag_hit and not partial_rollback:
                         tombstoned_tags.add((subj, tg))
                     latest = surviving_chain[-1]
-                    l_seq = int(latest.get("seq") or trigger_seq)
+                    src_seqs = sorted(
+                        {
+                            int(s)
+                            for s in (
+                                latest.get("source_seqs")
+                                or (
+                                    [latest.get("seq")]
+                                    if latest.get("seq") is not None
+                                    else []
+                                )
+                            )
+                            if s is not None
+                        }
+                    )
+                    l_seq = (
+                        max(src_seqs)
+                        if src_seqs
+                        else int(latest.get("seq") or trigger_seq)
+                    )
+                    if not src_seqs:
+                        src_seqs = [l_seq]
                     l_ts = (
                         int(latest["session_ts"])
                         if latest.get("session_ts") is not None
                         else None
                     )
                     res_curr = str(latest.get("state") or "")
+                    surv_seqs: list[int] = []
+                    for item in surviving_chain:
+                        for s in item.get("source_seqs") or (
+                            [item.get("seq")] if item.get("seq") is not None else []
+                        ):
+                            if s is not None and int(s) not in surv_seqs:
+                                surv_seqs.append(int(s))
+                    if partial_rollback:
+                        rolled_back_surviving_seqs[(subj, tg)] = set(surv_seqs)
+                    sup_seqs = sorted(s for s in surv_seqs if s not in src_seqs)
                     h_parts: list[str] = []
                     for idx, item in enumerate(surviving_chain):
                         st = str(item.get("state") or "")
@@ -874,12 +1369,13 @@ class SQLiteStore:
                         h_parts.append(detail)
                     c_str = " -> ".join(h_parts)
                     r_sum = (
-                        f"【状态时间线 | 主体: {subj} | 标签: {tg}】"
+                        f"【状态时间线 | 主体: {subj} | 标签: {base_tg}】"
                         f"当前最新状态: {res_curr} | 历史演化: {c_str}"
                     )
                     conn.execute(
                         "UPDATE tag_timelines SET latest_seq = ?, latest_session_ts = ?, "
                         "current_state = ?, history_chain = ?, rendered_summary = ?, "
+                        "superseded_seqs = ?, source_seqs = ?, "
                         "tombstoned = 0 WHERE user_id = ? AND subject = ? AND tag = ?",
                         (
                             l_seq,
@@ -887,10 +1383,19 @@ class SQLiteStore:
                             res_curr,
                             json.dumps(surviving_chain, ensure_ascii=False),
                             r_sum,
+                            json.dumps(sup_seqs, ensure_ascii=False),
+                            json.dumps(src_seqs, ensure_ascii=False),
                             user_id,
                             subj,
                             tg,
                         ),
+                    )
+                    src_placeholders = ",".join("?" for _ in src_seqs)
+                    conn.execute(
+                        f"UPDATE search_chunks SET tombstoned = 0 "
+                        f"WHERE user_id = ? AND kind = 'fact_item' "
+                        f"AND subject = ? AND tag = ? AND seq IN ({src_placeholders})",
+                        [user_id, subj, tg, *src_seqs],
                     )
                     conn.execute(
                         "UPDATE search_chunks SET seq = ?, session_ts = ?, display_text = ?, "
@@ -902,7 +1407,7 @@ class SQLiteStore:
                             l_ts,
                             r_sum,
                             r_sum,
-                            build_bm25_tokens(r_sum, subject=subj, tag=tg),
+                            build_bm25_tokens(r_sum, subject=subj, tag=base_tg),
                             user_id,
                             subj,
                             tg,
@@ -926,19 +1431,38 @@ class SQLiteStore:
         affected_parent_ids: dict[str, list[str]] = {}
 
         for r in chunk_rows:
+            self._check_deadline()
             cid = str(r["chunk_id"])
             if cid in reconstructed_tl_cids:
                 continue
             pmid = str(r["parent_msg_id"]) if r["parent_msg_id"] else None
+            c_seq = int(r["seq"])
             kind = str(r["kind"])
             tg = str(r["tag"]) if r["tag"] else ""
+            base_tg = get_base_tag(tg)
+            self._check_deadline()
             subj = str(r["subject"] or "user")
             disp = str(r["display_text"] or "")
             srch = str(r["search_text"] or "")
             combined = f"{disp}\n{srch}"
 
+            if (subj, tg) in rolled_back_surviving_seqs and (
+                c_seq in rolled_back_surviving_seqs[(subj, tg)]
+            ):
+                continue
+
             hit = False
-            if tg and (tg in tag_set or (subj, tg) in tombstoned_tags):
+            if (
+                (subj, tg) in rolled_back_surviving_seqs
+                and c_seq not in rolled_back_surviving_seqs[(subj, tg)]
+            ) or (
+                tg
+                and (
+                    tg in tag_set
+                    or (base_tg in tag_set and not target_id)
+                    or (subj, tg) in tombstoned_tags
+                )
+            ):
                 hit = True
             if not hit and _lexical_forget_match(combined):
                 hit = True
@@ -968,6 +1492,7 @@ class SQLiteStore:
                     )
 
         for cid in matched_chunk_ids:
+            self._check_deadline()
             conn.execute(
                 "UPDATE search_chunks SET tombstoned = 1 WHERE chunk_id = ?",
                 (cid,),
@@ -982,6 +1507,7 @@ class SQLiteStore:
 
         tombstoned_user_seqs: set[tuple[str, int]] = set()
         for pr in parent_rows:
+            self._check_deadline()
             pmid = str(pr["msg_id"])
             p_seq = int(pr["seq"])
             p_role = str(pr["role"] or "")
@@ -1086,6 +1612,76 @@ class SQLiteStore:
 
         self._maybe_commit()
         return rebuilt_timelines
+
+    def sync_dirty_timelines(
+        self,
+        user_id: str,
+        session_id: str,
+        dirty_keys: Sequence[tuple[str, str]],
+    ) -> None:
+        if not dirty_keys:
+            return
+        conn = self._connect()
+        for subj, tag in dict.fromkeys(dirty_keys):
+            tl_row = conn.execute(
+                "SELECT latest_seq, latest_session_ts, current_state, rendered_summary "
+                "FROM tag_timelines "
+                "WHERE user_id = ? AND subject = ? AND tag = ? AND tombstoned = 0",
+                (user_id, subj, tag),
+            ).fetchone()
+            if tl_row is None:
+                continue
+            tl_seq = int(tl_row["latest_seq"])
+            tl_ts = (
+                int(tl_row["latest_session_ts"])
+                if tl_row["latest_session_ts"] is not None
+                else None
+            )
+            curr_st = str(tl_row["current_state"] or "")
+            rendered_summary = str(tl_row["rendered_summary"] or "")
+
+            fact_row = conn.execute(
+                "SELECT chunk_id, embedding FROM search_chunks "
+                "WHERE user_id = ? AND kind = 'fact_item' "
+                "AND subject = ? AND tag = ? AND seq = ? AND tombstoned = 0 "
+                "ORDER BY chunk_id DESC LIMIT 1",
+                (user_id, subj, tag, tl_seq),
+            ).fetchone()
+            vec: list[float] = []
+            if fact_row is not None:
+                vec = blob_to_vector(fact_row["embedding"])
+                if not vec:
+                    vec = list(self._vector_cache.get(str(fact_row["chunk_id"])) or [])
+            if fact_row is None or not vec:
+                raise RuntimeError(
+                    f"Fail-closed: missing active fact_item or embedding for timeline "
+                    f"({user_id}, {subj}, {tag}) at seq={tl_seq}"
+                )
+
+            tl_chunk_id = f"tl:{user_id}:{subj}:{tag}"
+            display_tag = get_base_tag(tag)
+            tl_search_text = f"{display_tag} {curr_st}\n{rendered_summary}".strip()
+            tl_bm25 = build_bm25_tokens(tl_search_text, subject=subj, tag=display_tag)
+            tier = "other_person" if subj.casefold() != "user" else "user_direct"
+            self.upsert_chunk(
+                chunk_id=tl_chunk_id,
+                user_id=user_id,
+                session_id=session_id,
+                parent_msg_id=None,
+                seq=tl_seq,
+                session_ts=tl_ts,
+                kind="timeline_summary",
+                subject=subj,
+                tag=tag,
+                source_tier=tier,
+                display_text=rendered_summary,
+                search_text=tl_search_text,
+                bm25_tokens=tl_bm25,
+                event_time_start=tl_ts,
+                event_time_end=tl_ts,
+                embedding=vec,
+                tombstoned=0,
+            )
 
     def get_active_chunks(self, user_id: str) -> list[dict[str, Any]]:
         conn = self._connect()
@@ -1280,6 +1876,117 @@ class SQLiteStore:
             )
             out[(str(r["subject"]), str(r["tag"]))] = (l_ts, int(r["latest_seq"]))
         return out
+
+    def get_superseded_seqs_map(
+        self, user_id: str
+    ) -> dict[tuple[str, int], list[tuple[int, str, str]]]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT subject, tag, current_state, latest_seq, superseded_seqs "
+            "FROM tag_timelines WHERE user_id = ? AND tombstoned = 0",
+            (user_id,),
+        ).fetchall()
+        out: dict[tuple[str, int], list[tuple[int, str, str]]] = {}
+        for r in rows:
+            subj_low = str(r["subject"] or "user").strip().casefold()
+            l_seq = int(r["latest_seq"])
+            raw_tag = str(r["tag"] or "")
+            disp_tag = get_base_tag(raw_tag)
+            curr_st = str(r["current_state"] or "")
+            raw_sup = str(r["superseded_seqs"] or "[]")
+            with contextlib.suppress(Exception):
+                sup_list = json.loads(raw_sup)
+                if isinstance(sup_list, list):
+                    for s in sup_list:
+                        s_int = int(s)
+                        if s_int != l_seq:
+                            out.setdefault((subj_low, s_int), []).append(
+                                (l_seq, disp_tag, curr_st)
+                            )
+        return out
+
+    def get_timeline_pull_map(self, user_id: str) -> dict[str, list[int]]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT subject, tag, latest_seq, superseded_seqs, source_seqs "
+            "FROM tag_timelines WHERE user_id = ? AND tombstoned = 0",
+            (user_id,),
+        ).fetchall()
+        out: dict[str, list[int]] = {}
+        for r in rows:
+            subj = str(r["subject"])
+            tg = str(r["tag"])
+            l_seq = int(r["latest_seq"])
+            sup_set: set[int] = set()
+            with contextlib.suppress(Exception):
+                loaded_sup = json.loads(str(r["superseded_seqs"] or "[]"))
+                if isinstance(loaded_sup, list):
+                    sup_set = {int(x) for x in loaded_sup}
+            src_list: list[int] = []
+            with contextlib.suppress(Exception):
+                loaded_src = json.loads(str(r["source_seqs"] or "[]"))
+                if isinstance(loaded_src, list):
+                    src_list = [int(x) for x in loaded_src if int(x) not in sup_set]
+            if not src_list and l_seq not in sup_set:
+                src_list = [l_seq]
+            out[f"tl:{user_id}:{subj}:{tg}"] = src_list
+        return out
+
+    def get_time_matched_seqs(self, user_id: str, start_ts: int, end_ts: int) -> set[int]:
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT DISTINCT sc.seq
+            FROM search_chunks sc
+            WHERE sc.user_id = ?
+              AND sc.event_time_start IS NOT NULL
+              AND sc.event_time_end IS NOT NULL
+              AND sc.event_time_start <= ?
+              AND sc.event_time_end >= ?
+              AND (
+                  sc.tombstoned = 0
+                  OR (
+                      sc.kind = 'fact_item'
+                      AND EXISTS (
+                          SELECT 1 FROM parent_messages p
+                          WHERE p.msg_id = sc.parent_msg_id AND p.tombstoned = 0
+                      )
+                  )
+              )
+            """,
+            (user_id, end_ts, start_ts),
+        ).fetchall()
+        return {int(r["seq"]) for r in rows if r["seq"] is not None}
+
+    def get_parent_messages_by_seqs(
+        self, user_id: str, seqs: Sequence[int]
+    ) -> dict[int, dict[str, Any]]:
+        seq_list = list(dict.fromkeys(int(s) for s in seqs if s is not None))
+        if not seq_list:
+            return {}
+        conn = self._connect()
+        placeholders = ",".join("?" for _ in seq_list)
+        rows = conn.execute(
+            f"""
+            SELECT msg_id, user_id, session_id, request_id, seq, role, speaker,
+                   content, session_ts, session_time_str, fact_notes, tombstoned
+            FROM parent_messages
+            WHERE user_id = ? AND seq IN ({placeholders}) AND tombstoned = 0
+            """,
+            [user_id, *seq_list],
+        ).fetchall()
+        return {int(r["seq"]): dict(r) for r in rows}
+
+    def is_seq_draft_fiction(self, user_id: str, seq: int) -> bool:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT source_tier FROM search_chunks "
+            "WHERE user_id = ? AND seq = ? AND kind = 'raw_slice' AND tombstoned = 0",
+            (user_id, seq),
+        ).fetchall()
+        return bool(rows) and all(
+            str(r["source_tier"] or "user_direct") == "user_draft_fiction" for r in rows
+        )
 
 
 class SupabaseStore:
