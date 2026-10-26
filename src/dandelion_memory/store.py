@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import re
 import sqlite3
 from array import array
 from collections.abc import Iterator, Sequence
@@ -645,6 +646,7 @@ class SQLiteStore:
 
         tag_set = {t.strip() for t in target_existing_tags if t and t.strip()}
         kw_list = [k.strip() for k in target_keywords if k and len(k.strip()) >= 2]
+        cjk_kws = [k for k in kw_list if re.search(r"[\u3400-\u9fff]{2,}", k)]
         # P1-2: Prefer target_keywords as denominator; fallback to target_description if empty
         kw_terms = set(tokenize_bm25(" ".join(kw_list)))
         desc_terms = set(tokenize_bm25(target_description))
@@ -663,8 +665,14 @@ class SQLiteStore:
             tg = str(r["tag"])
             text_combined = f"{tg} {r['current_state']} {r['rendered_summary']}"
             matched = tg in tag_set or any(
-                kw.casefold() in text_combined.casefold() for kw in kw_list
+                kw.casefold() in text_combined.casefold() for kw in cjk_kws
             )
+            if not matched and kw_list:
+                kw_hits = sum(
+                    1 for kw in kw_list if kw.casefold() in text_combined.casefold()
+                )
+                if (kw_hits / len(kw_list)) >= 0.35:
+                    matched = True
             if not matched and target_terms:
                 cand_terms = set(tokenize_bm25(text_combined))
                 overlap = len(target_terms & cand_terms) / max(1, len(target_terms))
@@ -711,10 +719,16 @@ class SQLiteStore:
             hit = False
             if tg and (tg in tag_set or (subj, tg) in tombstoned_tags):
                 hit = True
-            if not hit and kw_list and any(
-                kw.casefold() in combined.casefold() for kw in kw_list
+            if not hit and cjk_kws and any(
+                kw.casefold() in combined.casefold() for kw in cjk_kws
             ):
                 hit = True
+            if not hit and kw_list:
+                kw_hits = sum(
+                    1 for kw in kw_list if kw.casefold() in combined.casefold()
+                )
+                if (kw_hits / len(kw_list)) >= 0.35:
+                    hit = True
             if not hit and target_terms:
                 c_terms = set(tokenize_bm25(combined))
                 overlap = len(target_terms & c_terms) / max(1, len(target_terms))
