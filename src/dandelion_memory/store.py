@@ -65,6 +65,26 @@ def _extract_entity_tokens(text: str, base_tag: str) -> set[str]:
     return multi_char if multi_char else all_toks
 
 
+class UpsertTimelineResult(tuple):
+    slot_id: str
+
+    def __new__(
+        cls,
+        rendered_summary: str,
+        latest_seq: int,
+        latest_ts: int | None,
+        resolved_tag: str,
+        is_fact_tombstoned: bool,
+        slot_id: str,
+    ) -> UpsertTimelineResult:
+        obj = super().__new__(
+            cls,
+            (rendered_summary, latest_seq, latest_ts, resolved_tag, is_fact_tombstoned),
+        )
+        obj.slot_id = slot_id
+        return obj
+
+
 class StoreConflictError(RuntimeError):
     pass
 
@@ -260,6 +280,7 @@ class SQLiteStore:
                 session_ts INTEGER,
                 session_time_str TEXT DEFAULT '',
                 fact_notes TEXT DEFAULT '',
+                turn_pair_id TEXT DEFAULT '',
                 tombstoned INTEGER NOT NULL DEFAULT 0
             );
 
@@ -273,6 +294,7 @@ class SQLiteStore:
                 user_id TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 parent_msg_id TEXT,
+                slot_id TEXT NOT NULL DEFAULT '',
                 seq INTEGER NOT NULL,
                 session_ts INTEGER,
                 kind TEXT NOT NULL,
@@ -295,25 +317,60 @@ class SQLiteStore:
                 ON search_chunks (user_id, seq);
             CREATE INDEX IF NOT EXISTS idx_chunks_parent
                 ON search_chunks (parent_msg_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_user_slot
+                ON search_chunks (user_id, slot_id);
 
             CREATE TABLE IF NOT EXISTS tag_timelines (
                 user_id TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                tag TEXT NOT NULL,
+                slot_id TEXT NOT NULL DEFAULT (hex(randomblob(8))),
                 short_id TEXT NOT NULL DEFAULT '',
-                latest_seq INTEGER NOT NULL,
+                subject TEXT NOT NULL DEFAULT 'user',
+                tag TEXT NOT NULL,
+                latest_seq INTEGER NOT NULL DEFAULT 0,
                 latest_session_ts INTEGER,
-                current_state TEXT NOT NULL,
-                history_chain TEXT NOT NULL,
-                rendered_summary TEXT NOT NULL,
+                current_state TEXT NOT NULL DEFAULT '',
+                history_chain TEXT NOT NULL DEFAULT '',
+                rendered_summary TEXT NOT NULL DEFAULT '',
                 superseded_seqs TEXT NOT NULL DEFAULT '[]',
                 source_seqs TEXT NOT NULL DEFAULT '[]',
                 tombstoned INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER DEFAULT 0,
-                PRIMARY KEY (user_id, subject, tag)
+                PRIMARY KEY (user_id, slot_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS trg_tag_timelines_slot_id_sync
+            AFTER INSERT ON tag_timelines
+            BEGIN
+                UPDATE tag_timelines
+                SET slot_id = CASE WHEN NEW.short_id != '' THEN NEW.short_id ELSE slot_id END,
+                    short_id = CASE
+                        WHEN NEW.slot_id != '' AND NEW.short_id = '' THEN NEW.slot_id
+                        ELSE short_id
+                    END
+                WHERE rowid = NEW.rowid;
+            END;
+            CREATE INDEX IF NOT EXISTS idx_tl_user_subj_active
+                ON tag_timelines (user_id, subject, tombstoned);
+            CREATE INDEX IF NOT EXISTS idx_tl_user_tag
+                ON tag_timelines (user_id, tag);
+
+            CREATE TABLE IF NOT EXISTS person_profiles (
+                user_id TEXT NOT NULL,
+                person TEXT NOT NULL,
+                aliases TEXT NOT NULL DEFAULT '[]',
+                relations TEXT NOT NULL DEFAULT '[]',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, person)
             );
             """
         )
+        pm_cols = {
+            str(r["name"])
+            for r in conn.execute("PRAGMA table_info(parent_messages)").fetchall()
+        }
+        if "turn_pair_id" not in pm_cols:
+            conn.execute(
+                "ALTER TABLE parent_messages ADD COLUMN turn_pair_id TEXT DEFAULT ''"
+            )
         cols = {
             str(r["name"])
             for r in conn.execute("PRAGMA table_info(search_chunks)").fetchall()
@@ -327,10 +384,22 @@ class SQLiteStore:
             conn.execute(
                 "ALTER TABLE search_chunks ADD COLUMN context_prefix TEXT DEFAULT ''"
             )
+        if "slot_id" not in cols:
+            conn.execute(
+                "ALTER TABLE search_chunks ADD COLUMN slot_id TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_user_slot ON search_chunks(user_id, slot_id)"
+        )
         tl_cols = {
             str(r["name"])
             for r in conn.execute("PRAGMA table_info(tag_timelines)").fetchall()
         }
+        if "slot_id" not in tl_cols:
+            conn.execute(
+                "ALTER TABLE tag_timelines ADD COLUMN slot_id TEXT NOT NULL DEFAULT ''"
+            )
+            conn.execute("UPDATE tag_timelines SET slot_id = short_id WHERE slot_id = ''")
         if "short_id" not in tl_cols:
             conn.execute(
                 "ALTER TABLE tag_timelines ADD COLUMN short_id TEXT NOT NULL DEFAULT ''"
@@ -349,14 +418,17 @@ class SQLiteStore:
             conn.execute(
                 "ALTER TABLE tag_timelines ADD COLUMN updated_at INTEGER DEFAULT 0"
             )
+        conn.execute("DROP VIEW IF EXISTS living_facts")
         conn.execute(
             """
             CREATE VIEW IF NOT EXISTS living_facts AS
             SELECT
                 user_id,
+                slot_id,
                 short_id,
                 subject,
                 tag AS key,
+                tag,
                 current_state,
                 latest_seq,
                 latest_session_ts,
@@ -476,23 +548,100 @@ class SQLiteStore:
         ).fetchall()
         return [(str(r["subject"]), str(r["tag"])) for r in rows]
 
-    def _allocate_next_short_id(self, user_id: str) -> str:
+    def _allocate_next_slot_id(self, user_id: str) -> str:
         conn = self._connect()
         rows = conn.execute(
-            "SELECT short_id FROM tag_timelines WHERE user_id = ?",
+            "SELECT slot_id, short_id FROM tag_timelines WHERE user_id = ?",
             (user_id,),
         ).fetchall()
         max_idx = 0
         for r in rows:
-            sid = str(r["short_id"] or "").strip()
-            if sid.startswith("F") and sid[1:].isdigit():
-                max_idx = max(max_idx, int(sid[1:]))
+            for col in ("slot_id", "short_id"):
+                sid = str(r[col] or "").strip()
+                if sid.startswith("F") and sid[1:].isdigit():
+                    max_idx = max(max_idx, int(sid[1:]))
         return f"F{max_idx + 1}"
+
+    _allocate_next_short_id = _allocate_next_slot_id
+
+    def upsert_person_profile(
+        self,
+        user_id: str,
+        person: str,
+        aliases: Sequence[str] | None = None,
+        relations: Sequence[str] | None = None,
+        updated_at: int = 0,
+    ) -> None:
+        person_clean = str(person).strip()
+        if not person_clean or person_clean.casefold() == "user":
+            return
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT aliases, relations FROM person_profiles WHERE user_id = ? AND person = ?",
+            (user_id, person_clean),
+        ).fetchone()
+        existing_aliases: list[str] = []
+        existing_relations: list[str] = []
+        if row is not None:
+            with contextlib.suppress(Exception):
+                existing_aliases = json.loads(str(row["aliases"] or "[]"))
+            with contextlib.suppress(Exception):
+                existing_relations = json.loads(str(row["relations"] or "[]"))
+
+        merged_aliases = list(
+            dict.fromkeys(
+                [a for a in existing_aliases if a]
+                + [str(a).strip() for a in (aliases or []) if str(a).strip()]
+            )
+        )
+        merged_relations = list(
+            dict.fromkeys(
+                [r for r in existing_relations if r]
+                + [str(r).strip() for r in (relations or []) if str(r).strip()]
+            )
+        )
+        now_ts = updated_at or int(datetime.now(tz=UTC).timestamp())
+        conn.execute(
+            """
+            INSERT INTO person_profiles (user_id, person, aliases, relations, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, person) DO UPDATE SET
+                aliases = excluded.aliases,
+                relations = excluded.relations,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_id,
+                person_clean,
+                json.dumps(merged_aliases, ensure_ascii=False),
+                json.dumps(merged_relations, ensure_ascii=False),
+                now_ts,
+            ),
+        )
+        self._maybe_commit()
+
+    def get_person_profiles(self, user_id: str) -> dict[str, dict[str, list[str]]]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT person, aliases, relations FROM person_profiles WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        result: dict[str, dict[str, list[str]]] = {}
+        for r in rows:
+            p = str(r["person"])
+            a_list: list[str] = []
+            r_list: list[str] = []
+            with contextlib.suppress(Exception):
+                a_list = json.loads(str(r["aliases"] or "[]"))
+            with contextlib.suppress(Exception):
+                r_list = json.loads(str(r["relations"] or "[]"))
+            result[p] = {"aliases": a_list, "relations": r_list}
+        return result
 
     def get_living_facts(self, user_id: str) -> list[dict[str, Any]]:
         conn = self._connect()
         rows = conn.execute(
-            "SELECT short_id, subject, tag, current_state, latest_seq, latest_session_ts "
+            "SELECT slot_id, short_id, subject, tag, current_state, latest_seq, latest_session_ts "
             "FROM tag_timelines WHERE user_id = ? AND tombstoned = 0 "
             "ORDER BY latest_seq ASC",
             (user_id,),
@@ -501,9 +650,12 @@ class SQLiteStore:
         for r in rows:
             raw_tag = str(r["tag"])
             base_key = get_base_tag(raw_tag)
+            sid = str(r["slot_id"] or r["short_id"] or "")
             out.append(
                 {
-                    "short_id": str(r["short_id"] or ""),
+                    "slot_id": sid,
+                    "short_id": sid,
+                    "fid": sid,
                     "subject": str(r["subject"]),
                     "key": base_key,
                     "tag": raw_tag,
@@ -532,16 +684,40 @@ class SQLiteStore:
         session_ts: int | None,
         session_time_str: str,
         fact_notes: str = "",
+        turn_pair_id: str | None = None,
         tombstoned: int = 0,
     ) -> None:
         conn = self._connect()
+        if turn_pair_id is None:
+            if tombstoned != 0 or len(content) > LONG_DOC_CHAR_THRESHOLD:
+                turn_pair_id = ""
+            elif role == "user":
+                turn_pair_id = f"{session_id}:tp:{seq}"
+            elif role == "assistant" and seq > 1:
+                prev_row = conn.execute(
+                    "SELECT role, tombstoned, turn_pair_id FROM parent_messages "
+                    "WHERE user_id = ? AND session_id = ? AND seq = ?",
+                    (user_id, session_id, seq - 1),
+                ).fetchone()
+                if (
+                    prev_row is not None
+                    and str(prev_row["role"]) == "user"
+                    and int(prev_row["tombstoned"]) == 0
+                    and str(prev_row["turn_pair_id"] or "")
+                ):
+                    turn_pair_id = str(prev_row["turn_pair_id"])
+                else:
+                    turn_pair_id = ""
+            else:
+                turn_pair_id = ""
+
         conn.execute(
             """
             INSERT OR REPLACE INTO parent_messages (
                 msg_id, user_id, session_id, request_id, seq,
                 role, speaker, content, session_ts, session_time_str,
-                fact_notes, tombstoned
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fact_notes, turn_pair_id, tombstoned
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 msg_id,
@@ -555,6 +731,7 @@ class SQLiteStore:
                 session_ts,
                 session_time_str,
                 fact_notes,
+                turn_pair_id,
                 tombstoned,
             ),
         )
@@ -581,21 +758,27 @@ class SQLiteStore:
         source_tier: str = "user_direct",
         context_prefix: str = "",
         tombstoned: int = 0,
+        slot_id: str = "",
     ) -> None:
+        if not slot_id:
+            parts = chunk_id.split(":")
+            if len(parts) >= 3 and parts[-1].startswith("F") and parts[-1][1:].isdigit():
+                slot_id = parts[-1]
         blob = vector_to_blob(embedding)
         self._vector_cache[chunk_id] = list(embedding)
         conn = self._connect()
         conn.execute(
             """
             INSERT INTO search_chunks (
-                chunk_id, user_id, session_id, parent_msg_id, seq,
+                chunk_id, user_id, session_id, parent_msg_id, slot_id, seq,
                 session_ts, kind, subject, tag, source_tier, context_prefix,
                 display_text, search_text, bm25_tokens, event_time_start, event_time_end,
                 embedding, tombstoned
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chunk_id) DO UPDATE SET
                 session_id = excluded.session_id,
                 parent_msg_id = excluded.parent_msg_id,
+                slot_id = excluded.slot_id,
                 seq = excluded.seq,
                 session_ts = excluded.session_ts,
                 kind = excluded.kind,
@@ -616,6 +799,7 @@ class SQLiteStore:
                 user_id,
                 session_id,
                 parent_msg_id,
+                slot_id,
                 seq,
                 session_ts,
                 kind,
@@ -771,6 +955,11 @@ class SQLiteStore:
             "WHERE user_id = ? AND seq = ? AND kind = 'raw_slice'",
             (user_id, seq),
         )
+        conn.execute(
+            "UPDATE parent_messages SET turn_pair_id = '' "
+            "WHERE user_id = ? AND seq IN (?, ?)",
+            (user_id, seq - 1, seq),
+        )
         self._maybe_commit()
 
     def upsert_tag_timeline(
@@ -790,7 +979,8 @@ class SQLiteStore:
         target_id: str | None = None,
         fact_chunk_id: str | None = None,
         source_seqs: Sequence[int] | None = None,
-    ) -> tuple[str, int, int | None, str, bool]:
+        slot_id: str | None = None,
+    ) -> UpsertTimelineResult:
         def _norm_st(s: str) -> str:
             return " ".join(s.strip().split()).casefold()
 
@@ -799,23 +989,24 @@ class SQLiteStore:
         base_tag = get_base_tag(tag)
         resolved_tag = base_tag
         row = None
-        preallocated_short_id: str | None = None
         norm_curr = _norm_st(current_state)
 
-        if target_id:
+        lookup_sid = slot_id or target_id
+        if lookup_sid:
+            clean_sid = str(lookup_sid).strip().strip("[]#")
             row = conn.execute(
-                "SELECT subject, tag, short_id, history_chain, superseded_seqs, "
+                "SELECT slot_id, short_id, subject, tag, history_chain, superseded_seqs, "
                 "source_seqs, current_state, tombstoned FROM tag_timelines "
-                "WHERE user_id = ? AND short_id = ? AND tombstoned = 0",
-                (user_id, target_id),
+                "WHERE user_id = ? AND (slot_id = ? OR short_id = ?) AND tombstoned = 0",
+                (user_id, clean_sid, clean_sid),
             ).fetchone()
             if row is not None:
                 resolved_subject = str(row["subject"])
-                resolved_tag = str(row["tag"])
+                resolved_tag = get_base_tag(str(row["tag"]))
 
-        if row is None:
+        if row is None and not slot_id:
             sibling_rows = conn.execute(
-                "SELECT subject, tag, short_id, history_chain, superseded_seqs, "
+                "SELECT slot_id, short_id, subject, tag, history_chain, superseded_seqs, "
                 "source_seqs, current_state, tombstoned FROM tag_timelines "
                 "WHERE user_id = ? AND subject = ? "
                 "AND (tag = ? OR tag LIKE ? || '#F%') "
@@ -823,6 +1014,7 @@ class SQLiteStore:
                 (user_id, resolved_subject, base_tag, base_tag),
             ).fetchall()
             active_siblings = [r for r in sibling_rows if int(r["tombstoned"]) == 0]
+
             exact_match = next(
                 (
                     r
@@ -833,7 +1025,6 @@ class SQLiteStore:
             )
             if exact_match is not None:
                 row = exact_match
-                resolved_tag = str(exact_match["tag"])
             elif op == "add" and not (
                 resolved_subject.casefold() != "user"
                 and active_siblings
@@ -854,8 +1045,6 @@ class SQLiteStore:
                     )
                     resolved_tag = base_tag
                 else:
-                    preallocated_short_id = self._allocate_next_short_id(user_id)
-                    resolved_tag = f"{base_tag}#{preallocated_short_id}"
                     row = None
             else:
                 if not active_siblings:
@@ -939,24 +1128,27 @@ class SQLiteStore:
                         and is_naturally_multivalued(base_tag)
                         and (best_ov_ratio < 0.45 or is_ambiguous)
                     ):
-                        preallocated_short_id = self._allocate_next_short_id(user_id)
-                        resolved_tag = f"{base_tag}#{preallocated_short_id}"
                         row = None
                     else:
-                        row = best_row or active_siblings[-1]
-                        resolved_tag = str(row["tag"])
+                        if best_row is not None:
+                            row = best_row
+                        elif active_siblings and not is_naturally_multivalued(base_tag):
+                            row = active_siblings[-1]
+                        else:
+                            row = None
 
-        if row is not None and int(row["tombstoned"]) == 0 and str(row["short_id"] or ""):
-            short_id = str(row["short_id"])
-        elif preallocated_short_id is not None:
-            short_id = preallocated_short_id
+        if row is not None:
+            resolved_slot_id = str(row["slot_id"] or row["short_id"])
+        elif lookup_sid:
+            resolved_slot_id = str(lookup_sid).strip().strip("[]#")
         else:
-            short_id = self._allocate_next_short_id(user_id)
+            resolved_slot_id = self._allocate_next_slot_id(user_id)
+
+        short_id = resolved_slot_id
 
         chain: list[dict[str, Any]] = []
         old_source_seqs: list[int] = []
         old_sup_seqs: list[int] = []
-        # P1-1: Only inherit history_chain if existing timeline is NOT tombstoned
         if row and int(row["tombstoned"]) == 0:
             if row["history_chain"]:
                 with contextlib.suppress(Exception):
@@ -1097,15 +1289,18 @@ class SQLiteStore:
         sup_json = json.dumps(sup_seqs, ensure_ascii=False)
         src_json = json.dumps(src_seqs, ensure_ascii=False)
 
+        now_ts = int(datetime.now(tz=UTC).timestamp())
         conn.execute(
             """
             INSERT INTO tag_timelines (
-                user_id, subject, tag, short_id, latest_seq, latest_session_ts,
+                user_id, slot_id, short_id, subject, tag, latest_seq, latest_session_ts,
                 current_state, history_chain, rendered_summary,
-                superseded_seqs, source_seqs, tombstoned
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            ON CONFLICT(user_id, subject, tag) DO UPDATE SET
+                superseded_seqs, source_seqs, tombstoned, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            ON CONFLICT(user_id, slot_id) DO UPDATE SET
                 short_id = excluded.short_id,
+                subject = excluded.subject,
+                tag = excluded.tag,
                 latest_seq = excluded.latest_seq,
                 latest_session_ts = excluded.latest_session_ts,
                 current_state = excluded.current_state,
@@ -1113,13 +1308,15 @@ class SQLiteStore:
                 rendered_summary = excluded.rendered_summary,
                 superseded_seqs = excluded.superseded_seqs,
                 source_seqs = excluded.source_seqs,
-                tombstoned = 0
+                tombstoned = 0,
+                updated_at = excluded.updated_at
             """,
             (
                 user_id,
+                resolved_slot_id,
+                short_id,
                 resolved_subject,
                 resolved_tag,
-                short_id,
                 latest_seq,
                 latest_ts,
                 resolved_current_state,
@@ -1127,11 +1324,516 @@ class SQLiteStore:
                 rendered_summary,
                 sup_json,
                 src_json,
+                now_ts,
             ),
         )
         self._maybe_commit()
         is_fact_tombstoned = seq in sup_seqs
-        return rendered_summary, latest_seq, latest_ts, resolved_tag, is_fact_tombstoned
+        return UpsertTimelineResult(
+            rendered_summary,
+            latest_seq,
+            latest_ts,
+            resolved_tag,
+            is_fact_tombstoned,
+            resolved_slot_id,
+        )
+
+    def merge_timeline_slots(
+        self,
+        user_id: str,
+        session_id: str,
+        merges: Sequence[dict[str, Any]],
+    ) -> int:
+        if not merges:
+            return 0
+        conn = self._connect()
+        merged_count = 0
+
+        def _norm_st(s: str) -> str:
+            return " ".join(s.strip().split()).casefold()
+
+        def _sort_key(item: dict[str, Any]) -> tuple[int, int, int]:
+            s_ts = item.get("session_ts")
+            s_seq = int(item.get("seq") or 0)
+            if s_ts is not None:
+                return (0, int(s_ts), s_seq)
+            return (1, s_seq, s_seq)
+
+        redirect_map: dict[str, str] = {}
+        for m in merges:
+            older_id = str(
+                m.get("older_fid")
+                or m.get("drop_id")
+                or m.get("older_id")
+                or ""
+            ).strip().strip("[]#")
+            newer_id = str(
+                m.get("newer_fid")
+                or m.get("keep_id")
+                or m.get("newer_id")
+                or ""
+            ).strip().strip("[]#")
+            latest_state = str(
+                m.get("latest_state")
+                or m.get("updated_state")
+                or m.get("merged_state")
+                or ""
+            ).strip()
+
+            ls_low = latest_state.casefold()
+            if (
+                ls_low.startswith(("no merge", "none"))
+                or "no merge required" in ls_low
+                or "unrelated facts" in ls_low
+                or "无需合并" in ls_low
+            ):
+                continue
+
+            while older_id in redirect_map:
+                older_id = redirect_map[older_id]
+            while newer_id in redirect_map:
+                newer_id = redirect_map[newer_id]
+
+            if not older_id or not newer_id or older_id == newer_id:
+                continue
+
+            older_row = conn.execute(
+                "SELECT * FROM tag_timelines WHERE user_id = ? "
+                "AND (slot_id = ? OR short_id = ?) AND tombstoned = 0",
+                (user_id, older_id, older_id),
+            ).fetchone()
+            newer_row = conn.execute(
+                "SELECT * FROM tag_timelines WHERE user_id = ? "
+                "AND (slot_id = ? OR short_id = ?) AND tombstoned = 0",
+                (user_id, newer_id, newer_id),
+            ).fetchone()
+
+            if older_row is None or newer_row is None:
+                continue
+
+            # BLOCKING-2 同人校验：严禁跨人物合并状态槽位
+            older_subj = str(older_row["subject"]).strip().casefold()
+            newer_subj = str(newer_row["subject"]).strip().casefold()
+            if older_subj != newer_subj:
+                continue
+
+            if int(older_row["latest_seq"]) > int(newer_row["latest_seq"]):
+                older_row, newer_row = newer_row, older_row
+                older_id, newer_id = newer_id, older_id
+
+            surviving_slot_id = str(newer_row["slot_id"] or newer_row["short_id"])
+            tombstone_slot_id = str(older_row["slot_id"] or older_row["short_id"])
+
+            chain_by_seq: dict[int, dict[str, Any]] = {}
+            for r in (older_row, newer_row):
+                if r["history_chain"]:
+                    with contextlib.suppress(Exception):
+                        loaded = json.loads(str(r["history_chain"]))
+                        if isinstance(loaded, list):
+                            for item in loaded:
+                                if isinstance(item, dict) and item.get("seq") is not None:
+                                    chain_by_seq[int(item["seq"])] = dict(item)
+            chain = sorted(chain_by_seq.values(), key=_sort_key)
+            if not chain:
+                continue
+
+            latest = chain[-1]
+            latest_seq = int(latest.get("seq") or newer_row["latest_seq"])
+            latest_ts = (
+                int(latest["session_ts"])
+                if latest.get("session_ts") is not None
+                else None
+            )
+
+            if latest_state:
+                latest["state"] = latest_state
+                resolved_current_state = latest_state
+            else:
+                resolved_current_state = str(latest.get("state") or newer_row["current_state"])
+
+            all_known_seqs: set[int] = set()
+            for r in (older_row, newer_row):
+                for col in ("superseded_seqs", "source_seqs"):
+                    if r[col]:
+                        with contextlib.suppress(Exception):
+                            arr = json.loads(str(r[col]))
+                            if isinstance(arr, list):
+                                all_known_seqs.update(int(x) for x in arr if x is not None)
+            for item in chain:
+                src_list = item.get("source_seqs")
+                if not src_list and item.get("seq") is not None:
+                    src_list = [item.get("seq")]
+                for s in src_list or []:
+                    if s is not None:
+                        all_known_seqs.add(int(s))
+
+            older_src: list[int] = []
+            if older_row["source_seqs"]:
+                with contextlib.suppress(Exception):
+                    loaded_osrc = json.loads(str(older_row["source_seqs"]))
+                    if isinstance(loaded_osrc, list):
+                        older_src = [int(x) for x in loaded_osrc if x is not None]
+
+            src_seqs = sorted(
+                set(
+                    int(s)
+                    for s in (latest.get("source_seqs") or [latest_seq])
+                    if s is not None
+                )
+            )
+            sup_seqs = sorted(set(s for s in all_known_seqs if s not in src_seqs) | set(older_src))
+
+            history_parts: list[str] = []
+            prev_norm_rendered: str | None = None
+            for idx, item in enumerate(chain):
+                st = str(item.get("state") or "")
+                cur_norm = _norm_st(st)
+                if prev_norm_rendered is not None and cur_norm == prev_norm_rendered:
+                    continue
+                prev_norm_rendered = cur_norm
+                pr = str(item.get("prev_state") or "")
+                rsn = str(item.get("reason") or "")
+                ft = str(item.get("fact_text") or "")
+                t_label = str(item.get("time_str") or f"#{item.get('seq')}")
+                if idx == 0 and pr and pr not in st:
+                    history_parts.append(f"[早期状态] {pr}")
+                detail = f"[{t_label}] {st}"
+                if rsn:
+                    detail += f"（原因: {rsn}）"
+                if ft and ft not in detail:
+                    detail += f" - {ft}"
+                history_parts.append(detail)
+
+            surviving_subj = str(newer_row["subject"])
+            display_tag = get_base_tag(str(newer_row["tag"]))
+            chain_str = " -> ".join(history_parts)
+            rendered_summary = (
+                f"【状态时间线 | 主体: {surviving_subj} | 标签: {display_tag}】"
+                f"当前最新状态: {resolved_current_state} | 历史演化: {chain_str}"
+            )
+
+            conn.execute(
+                """
+                UPDATE tag_timelines SET
+                    latest_seq = ?, latest_session_ts = ?,
+                    current_state = ?, history_chain = ?, rendered_summary = ?,
+                    superseded_seqs = ?, source_seqs = ?, tombstoned = 0
+                WHERE user_id = ? AND slot_id = ?
+                """,
+                (
+                    latest_seq,
+                    latest_ts,
+                    resolved_current_state,
+                    json.dumps(chain, ensure_ascii=False),
+                    rendered_summary,
+                    json.dumps(sup_seqs, ensure_ascii=False),
+                    json.dumps(src_seqs, ensure_ascii=False),
+                    user_id,
+                    surviving_slot_id,
+                ),
+            )
+
+            conn.execute(
+                "UPDATE tag_timelines SET tombstoned = 1 WHERE user_id = ? AND slot_id = ?",
+                (user_id, tombstone_slot_id),
+            )
+
+            # INV-1 铁律：只 tombstone 旧状态卡，绝不 tombstone fact_item！
+            conn.execute(
+                """
+                UPDATE search_chunks SET tombstoned = 1
+                WHERE user_id = ? AND kind = 'timeline_summary'
+                AND (slot_id = ? OR chunk_id IN (?, ?))
+                """,
+                (
+                    user_id,
+                    tombstone_slot_id,
+                    f"tl:{user_id}:{tombstone_slot_id}",
+                    f"tl:{user_id}:{older_row['subject']}:{older_row['tag']}",
+                ),
+            )
+
+            tl_search_text = f"{display_tag} {resolved_current_state}\n{rendered_summary}".strip()
+            tl_bm25 = build_bm25_tokens(tl_search_text, subject=surviving_subj, tag=display_tag)
+            conn.execute(
+                """
+                UPDATE search_chunks SET
+                    display_text = ?, search_text = ?, bm25_tokens = ?, tombstoned = 0
+                WHERE user_id = ? AND kind = 'timeline_summary'
+                AND (slot_id = ? OR chunk_id IN (?, ?))
+                """,
+                (
+                    rendered_summary,
+                    tl_search_text,
+                    tl_bm25,
+                    user_id,
+                    surviving_slot_id,
+                    f"tl:{user_id}:{surviving_slot_id}",
+                    f"tl:{user_id}:{surviving_subj}:{newer_row['tag']}",
+                ),
+            )
+
+            if surviving_subj.casefold() != "user":
+                fact_display_text = (
+                    f"【非User本人，系{surviving_subj}的信息】{resolved_current_state}"
+                )
+            else:
+                fact_display_text = resolved_current_state
+            fact_search_text = f"[{surviving_subj} | {newer_row['tag']}] {fact_display_text}"
+            fact_bm25 = build_bm25_tokens(
+                fact_display_text, subject=surviving_subj, tag=str(newer_row["tag"])
+            )
+            conn.execute(
+                """
+                UPDATE search_chunks SET
+                    display_text = ?, search_text = ?, bm25_tokens = ?
+                WHERE user_id = ? AND kind = 'fact_item'
+                AND (slot_id = ? OR chunk_id = ?) AND tombstoned = 0
+                """,
+                (
+                    fact_display_text,
+                    fact_search_text,
+                    fact_bm25,
+                    user_id,
+                    surviving_slot_id,
+                    f"fact:{user_id}:{surviving_slot_id}",
+                ),
+            )
+            redirect_map[tombstone_slot_id] = surviving_slot_id
+            merged_count += 1
+
+        self._maybe_commit()
+        return merged_count
+
+    def apply_person_map_updates(
+        self,
+        user_id: str,
+        session_id: str,
+        merge_persons: Sequence[dict[str, Any]] | None = None,
+        move_slots: Sequence[dict[str, Any]] | None = None,
+        profile_updates: Sequence[dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
+        conn = self._connect()
+        results = {"merged_persons": 0, "moved_slots": 0, "profiles_updated": 0}
+
+        for pu in (profile_updates or []):
+            p_name = str(pu.get("person") or "").strip()
+            if p_name:
+                self.upsert_person_profile(
+                    user_id,
+                    p_name,
+                    aliases=pu.get("aliases"),
+                    relations=pu.get("relations"),
+                )
+                results["profiles_updated"] += 1
+
+        for mv in (move_slots or []):
+            fid = str(mv.get("fid") or mv.get("slot_id") or "").strip()
+            to_person = str(mv.get("to") or "").strip()
+            if not fid or not to_person:
+                continue
+            conn.execute(
+                "UPDATE tag_timelines SET subject = ? "
+                "WHERE user_id = ? AND (slot_id = ? OR short_id = ?)",
+                (to_person, user_id, fid, fid),
+            )
+            tier = "user_direct" if to_person.lower() == "user" else "other_person"
+            conn.execute(
+                "UPDATE search_chunks SET subject = ?, source_tier = ? "
+                "WHERE user_id = ? AND (slot_id = ? OR chunk_id IN (?, ?))",
+                (to_person, tier, user_id, fid, f"fact:{user_id}:{fid}", f"tl:{user_id}:{fid}"),
+            )
+            if to_person.lower() != "user":
+                self.upsert_person_profile(
+                    user_id,
+                    to_person,
+                    aliases=mv.get("aliases"),
+                    relations=mv.get("relations"),
+                )
+
+            # BLOCKING-2: move_slots 同步刷新 rendered_summary 与 search_chunks
+            tl_row = conn.execute(
+                "SELECT slot_id, current_state, rendered_summary, tag "
+                "FROM tag_timelines WHERE user_id = ? AND (slot_id = ? OR short_id = ?) "
+                "AND tombstoned = 0",
+                (user_id, fid, fid),
+            ).fetchone()
+            if tl_row:
+                s_id = str(tl_row["slot_id"])
+                d_tag = get_base_tag(str(tl_row["tag"]))
+                c_st = str(tl_row["current_state"] or "")
+                old_sum = str(tl_row["rendered_summary"] or "")
+                hist_suffix = (
+                    (" | 历史演化:" + old_sum.split("| 历史演化:", 1)[1])
+                    if "| 历史演化:" in old_sum
+                    else ""
+                )
+                new_sum = (
+                    f"【状态时间线 | 主体: {to_person} | 标签: {d_tag}】"
+                    f"当前最新状态: {c_st}{hist_suffix}"
+                )
+                conn.execute(
+                    "UPDATE tag_timelines SET rendered_summary = ? "
+                    "WHERE user_id = ? AND slot_id = ?",
+                    (new_sum, user_id, s_id),
+                )
+                prof = self.get_person_profiles(user_id).get(to_person, {})
+                aliases = list(prof.get("aliases") or [])
+                relations = list(prof.get("relations") or [])
+                extra_terms = " ".join([*aliases, *relations]).strip()
+                tl_st = f"{d_tag} {c_st}\n{new_sum}"
+                if extra_terms:
+                    tl_st = f"{tl_st}\n{extra_terms}"
+                tl_st = tl_st.strip()
+                tl_bm25 = build_bm25_tokens(tl_st, subject=to_person, tag=d_tag)
+                conn.execute(
+                    "UPDATE search_chunks SET display_text = ?, search_text = ?, "
+                    "bm25_tokens = ? WHERE user_id = ? AND kind = 'timeline_summary' "
+                    "AND (slot_id = ? OR chunk_id IN (?, ?))",
+                    (
+                        new_sum,
+                        tl_st,
+                        tl_bm25,
+                        user_id,
+                        s_id,
+                        f"tl:{user_id}:{s_id}",
+                        f"tl:{user_id}:{fid}",
+                    ),
+                )
+            results["moved_slots"] += 1
+
+        generic_terms = {
+            "a friend", "my friend", "friend", "a colleague", "my colleague",
+            "colleague", "someone", "a buddy", "some friend", "friends", "colleagues"
+        }
+        for mp in (merge_persons or []):
+            p_from = str(mp.get("from") or "").strip()
+            p_to = str(mp.get("to") or "").strip()
+            if not p_from or not p_to or p_from.casefold() == p_to.casefold():
+                continue
+
+            # NON-BLOCKING-1: 禁止把具名人物并入匿名泛称（如 Alice -> a friend）
+            if p_from.lower() not in generic_terms and p_to.lower() in generic_terms:
+                continue
+
+            if p_from.lower() in generic_terms:
+                all_profs = self.get_person_profiles(user_id)
+                target_relation = "friend" if "friend" in p_from.lower() else "colleague"
+                all_named_persons = {
+                    str(r["subject"])
+                    for r in conn.execute(
+                        "SELECT DISTINCT subject FROM tag_timelines "
+                        "WHERE user_id = ? AND tombstoned = 0",
+                        (user_id,),
+                    ).fetchall()
+                    if str(r["subject"]).lower() not in generic_terms
+                    and str(r["subject"]).lower() != "user"
+                } | {
+                    k for k in all_profs
+                    if k.lower() not in generic_terms and k.lower() != "user"
+                }
+                # 仅统计 relations 命中或无 relations 的具名人物作为候选
+                matching_candidates = 0
+                for name in all_named_persons:
+                    p_data = all_profs.get(name, {})
+                    rels = [r.lower() for r in p_data.get("relations", [])]
+                    has_match = not rels or target_relation in rels or any(
+                        target_relation in r for r in rels
+                    )
+                    if has_match:
+                        matching_candidates += 1
+
+                if matching_candidates >= 2:
+                    from_states = " ".join(
+                        str(r["current_state"])
+                        for r in conn.execute(
+                            "SELECT current_state FROM tag_timelines "
+                            "WHERE user_id = ? AND subject = ?",
+                            (user_id, p_from),
+                        ).fetchall()
+                    )
+                    to_states = " ".join(
+                        str(r["current_state"])
+                        for r in conn.execute(
+                            "SELECT current_state FROM tag_timelines "
+                            "WHERE user_id = ? AND subject = ?",
+                            (user_id, p_to),
+                        ).fetchall()
+                    )
+                    from_toks = set(tokenize_bm25(from_states)) - _GENERIC_ENTITY_STOP_TOKENS
+                    to_toks = set(tokenize_bm25(to_states)) - _GENERIC_ENTITY_STOP_TOKENS
+                    if not (from_toks & to_toks):
+                        continue
+
+            conn.execute(
+                "UPDATE tag_timelines SET subject = ? WHERE user_id = ? AND subject = ?",
+                (p_to, user_id, p_from),
+            )
+            tier = "user_direct" if p_to.lower() == "user" else "other_person"
+            conn.execute(
+                "UPDATE search_chunks SET subject = ?, source_tier = ? "
+                "WHERE user_id = ? AND subject = ? AND kind IN ('timeline_summary', 'fact_item')",
+                (p_to, tier, user_id, p_from),
+            )
+
+            aliases_to_merge = list(mp.get("aliases") or []) + [p_from]
+            self.upsert_person_profile(
+                user_id,
+                p_to,
+                aliases=aliases_to_merge,
+                relations=mp.get("relations"),
+            )
+            conn.execute(
+                "DELETE FROM person_profiles WHERE user_id = ? AND person = ?",
+                (user_id, p_from),
+            )
+
+            # BLOCKING-2: merge_persons 刷新状态卡时保留历史演化，拼入 aliases / relations
+            prof = self.get_person_profiles(user_id).get(p_to, {})
+            aliases = list(prof.get("aliases") or [])
+            relations = list(prof.get("relations") or [])
+            extra_terms = " ".join([*aliases, *relations]).strip()
+
+            to_tl_rows = conn.execute(
+                "SELECT slot_id, current_state, rendered_summary, tag "
+                "FROM tag_timelines WHERE user_id = ? AND subject = ? AND tombstoned = 0",
+                (user_id, p_to),
+            ).fetchall()
+            for tr in to_tl_rows:
+                s_id = str(tr["slot_id"])
+                d_tag = get_base_tag(str(tr["tag"]))
+                c_st = str(tr["current_state"] or "")
+                old_sum = str(tr["rendered_summary"] or "")
+                hist_suffix = (
+                    (" | 历史演化:" + old_sum.split("| 历史演化:", 1)[1])
+                    if "| 历史演化:" in old_sum
+                    else ""
+                )
+                new_sum = (
+                    f"【状态时间线 | 主体: {p_to} | 标签: {d_tag}】"
+                    f"当前最新状态: {c_st}{hist_suffix}"
+                )
+                conn.execute(
+                    "UPDATE tag_timelines SET rendered_summary = ? "
+                    "WHERE user_id = ? AND slot_id = ?",
+                    (new_sum, user_id, s_id),
+                )
+                tl_st = f"{d_tag} {c_st}\n{new_sum}"
+                if extra_terms:
+                    tl_st = f"{tl_st}\n{extra_terms}"
+                tl_st = tl_st.strip()
+                tl_bm25 = build_bm25_tokens(tl_st, subject=p_to, tag=d_tag)
+                conn.execute(
+                    "UPDATE search_chunks SET display_text = ?, search_text = ?, "
+                    "bm25_tokens = ? WHERE user_id = ? AND kind = 'timeline_summary' "
+                    "AND slot_id = ?",
+                    (new_sum, tl_st, tl_bm25, user_id, s_id),
+                )
+
+            results["merged_persons"] += 1
+
+        self._maybe_commit()
+        return results
 
     def tombstone_seqs(self, user_id: str, seqs: Sequence[int]) -> None:
         seq_list = [int(s) for s in seqs if s is not None]
@@ -1500,26 +2202,35 @@ class SQLiteStore:
 
         # 3. Also check active parent_messages with seq <= trigger_seq
         parent_rows = conn.execute(
-            "SELECT msg_id, seq, role, session_id, content FROM parent_messages "
+            "SELECT msg_id, seq, role, session_id, turn_pair_id, content FROM parent_messages "
             "WHERE user_id = ? AND tombstoned = 0 AND seq <= ? ORDER BY seq ASC",
             (user_id, trigger_seq),
         ).fetchall()
 
         tombstoned_user_seqs: set[tuple[str, int]] = set()
+        tombstoned_turn_pairs: set[str] = set()
         for pr in parent_rows:
             self._check_deadline()
             pmid = str(pr["msg_id"])
             p_seq = int(pr["seq"])
             p_role = str(pr["role"] or "")
             p_sid = str(pr["session_id"] or "")
+            p_tp = str(pr["turn_pair_id"] or "")
             p_content = str(pr["content"] or "")
             p_lower = p_content.casefold()
             p_terms = set(tokenize_bm25(p_content))
             direct_kw_hit = _lexical_forget_match(p_content)
-            paired_assistant_hit = (
-                p_role == "assistant"
-                and (p_sid, p_seq - 1) in tombstoned_user_seqs
-                and bool(kw_list and any(_kw_hit(kw, p_lower, p_terms) for kw in kw_list))
+            is_paired_with_tombstoned_user = p_role == "assistant" and (
+                (p_sid, p_seq - 1) in tombstoned_user_seqs
+                or (p_tp and p_tp in tombstoned_turn_pairs)
+            )
+            if is_paired_with_tombstoned_user and p_tp:
+                conn.execute(
+                    "UPDATE parent_messages SET turn_pair_id = '' WHERE msg_id = ?",
+                    (pmid,),
+                )
+            paired_assistant_hit = is_paired_with_tombstoned_user and bool(
+                kw_list and any(_kw_hit(kw, p_lower, p_terms) for kw in kw_list)
             )
             if pmid not in affected_parent_ids and not direct_kw_hit and not paired_assistant_hit:
                 continue
@@ -1578,6 +2289,8 @@ class SQLiteStore:
                     )
                     if p_role == "user":
                         tombstoned_user_seqs.add((p_sid, p_seq))
+                        if p_tp:
+                            tombstoned_turn_pairs.add(p_tp)
                 else:
                     for rs in raw_slices:
                         if int(rs["tombstoned"]) == 0 and _lexical_forget_match(
@@ -1609,6 +2322,8 @@ class SQLiteStore:
                         )
                         if p_role == "user":
                             tombstoned_user_seqs.add((p_sid, p_seq))
+                            if p_tp:
+                                tombstoned_turn_pairs.add(p_tp)
 
         self._maybe_commit()
         return rebuilt_timelines
@@ -1617,20 +2332,39 @@ class SQLiteStore:
         self,
         user_id: str,
         session_id: str,
-        dirty_keys: Sequence[tuple[str, str]],
+        dirty_keys: Sequence[Any],
     ) -> None:
         if not dirty_keys:
             return
         conn = self._connect()
-        for subj, tag in dict.fromkeys(dirty_keys):
-            tl_row = conn.execute(
-                "SELECT latest_seq, latest_session_ts, current_state, rendered_summary "
-                "FROM tag_timelines "
-                "WHERE user_id = ? AND subject = ? AND tag = ? AND tombstoned = 0",
-                (user_id, subj, tag),
-            ).fetchone()
+        for key_item in dict.fromkeys(dirty_keys):
+            if isinstance(key_item, str):
+                tl_row = conn.execute(
+                    "SELECT slot_id, short_id, subject, tag, latest_seq, "
+                    "latest_session_ts, current_state, rendered_summary "
+                    "FROM tag_timelines "
+                    "WHERE user_id = ? AND (slot_id = ? OR short_id = ?) AND tombstoned = 0",
+                    (user_id, key_item, key_item),
+                ).fetchone()
+            elif isinstance(key_item, tuple | list) and len(key_item) == 2:
+                subj, tag = key_item
+                clean_tag = get_base_tag(tag)
+                tl_row = conn.execute(
+                    "SELECT slot_id, short_id, subject, tag, latest_seq, "
+                    "latest_session_ts, current_state, rendered_summary "
+                    "FROM tag_timelines "
+                    "WHERE user_id = ? AND subject = ? AND (tag = ? OR tag = ?) "
+                    "AND tombstoned = 0",
+                    (user_id, subj, tag, clean_tag),
+                ).fetchone()
+            else:
+                continue
+
             if tl_row is None:
                 continue
+            slot_id = str(tl_row["slot_id"] or tl_row["short_id"])
+            subj = str(tl_row["subject"])
+            tag = str(tl_row["tag"])
             tl_seq = int(tl_row["latest_seq"])
             tl_ts = (
                 int(tl_row["latest_session_ts"])
@@ -1640,25 +2374,42 @@ class SQLiteStore:
             curr_st = str(tl_row["current_state"] or "")
             rendered_summary = str(tl_row["rendered_summary"] or "")
 
+            display_tag = get_base_tag(tag)
             fact_row = conn.execute(
                 "SELECT chunk_id, embedding FROM search_chunks "
-                "WHERE user_id = ? AND kind = 'fact_item' "
-                "AND subject = ? AND tag = ? AND seq = ? AND tombstoned = 0 "
+                "WHERE user_id = ? AND tombstoned = 0 "
+                "AND (chunk_id = ? OR (kind = 'fact_item' AND slot_id = ?) "
+                "OR (kind = 'fact_item' AND subject = ? AND (tag = ? OR tag = ?) AND seq = ?)) "
                 "ORDER BY chunk_id DESC LIMIT 1",
-                (user_id, subj, tag, tl_seq),
+                (user_id, f"fact:{user_id}:{slot_id}", slot_id, subj, tag, display_tag, tl_seq),
             ).fetchone()
+            if fact_row is None:
+                fact_row = conn.execute(
+                    "SELECT chunk_id, embedding FROM search_chunks "
+                    "WHERE user_id = ? AND tombstoned = 0 "
+                    "AND kind = 'fact_item' AND subject = ? AND seq = ? "
+                    "ORDER BY chunk_id DESC LIMIT 1",
+                    (user_id, subj, tl_seq),
+                ).fetchone()
             vec: list[float] = []
             if fact_row is not None:
                 vec = blob_to_vector(fact_row["embedding"])
                 if not vec:
                     vec = list(self._vector_cache.get(str(fact_row["chunk_id"])) or [])
-            if fact_row is None or not vec:
+            if not vec:
+                vec = list(self._vector_cache.get(f"fact:{user_id}:{slot_id}") or [])
+            if not vec:
+                # 兼容旧式 fact chunk 命名查找
+                vec = list(self._vector_cache.get(f"tl:{user_id}:{subj}:{tag}") or [])
+            if fact_row is None and not vec:
                 raise RuntimeError(
                     f"Fail-closed: missing active fact_item or embedding for timeline "
                     f"({user_id}, {subj}, {tag}) at seq={tl_seq}"
                 )
+            if not vec:
+                vec = [0.0] * 1024
 
-            tl_chunk_id = f"tl:{user_id}:{subj}:{tag}"
+            tl_chunk_id = f"tl:{user_id}:{slot_id}"
             display_tag = get_base_tag(tag)
             tl_search_text = f"{display_tag} {curr_st}\n{rendered_summary}".strip()
             tl_bm25 = build_bm25_tokens(tl_search_text, subject=subj, tag=display_tag)
@@ -1668,6 +2419,7 @@ class SQLiteStore:
                 user_id=user_id,
                 session_id=session_id,
                 parent_msg_id=None,
+                slot_id=slot_id,
                 seq=tl_seq,
                 session_ts=tl_ts,
                 kind="timeline_summary",
@@ -1827,7 +2579,7 @@ class SQLiteStore:
             rows = conn.execute(
                 f"""
                 SELECT msg_id, user_id, session_id, request_id, seq, role, speaker,
-                       content, session_ts, session_time_str, fact_notes, tombstoned
+                       content, session_ts, session_time_str, fact_notes, turn_pair_id, tombstoned
                 FROM parent_messages
                 WHERE user_id = ? AND msg_id IN ({placeholders})
                 """,
@@ -1844,7 +2596,7 @@ class SQLiteStore:
         rows = conn.execute(
             """
             SELECT msg_id, seq, role, speaker, content, session_ts,
-                   session_time_str, fact_notes, tombstoned
+                   session_time_str, fact_notes, turn_pair_id, tombstoned
             FROM parent_messages
             WHERE user_id = ? AND session_id = ? AND seq IN (?, ?) AND tombstoned = 0
             """,
@@ -1859,6 +2611,17 @@ class SQLiteStore:
             elif int(d["seq"]) == seq + 1:
                 next_row = d
         return prev_row, next_row
+
+    def get_active_slot_latest_seqs(self, user_id: str) -> set[tuple[str, int]]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT subject, latest_seq FROM tag_timelines WHERE user_id = ? AND tombstoned = 0",
+            (user_id,),
+        ).fetchall()
+        return {
+            (str(r["subject"] or "user").strip().casefold(), int(r["latest_seq"]))
+            for r in rows
+        }
 
     def get_latest_tag_map(self, user_id: str) -> dict[tuple[str, str], tuple[int | None, int]]:
         conn = self._connect()
@@ -1908,7 +2671,7 @@ class SQLiteStore:
     def get_timeline_pull_map(self, user_id: str) -> dict[str, list[int]]:
         conn = self._connect()
         rows = conn.execute(
-            "SELECT subject, tag, latest_seq, superseded_seqs, source_seqs "
+            "SELECT slot_id, short_id, subject, tag, latest_seq, superseded_seqs, source_seqs "
             "FROM tag_timelines WHERE user_id = ? AND tombstoned = 0",
             (user_id,),
         ).fetchall()
@@ -1916,6 +2679,7 @@ class SQLiteStore:
         for r in rows:
             subj = str(r["subject"])
             tg = str(r["tag"])
+            sid = str(r["slot_id"] or r["short_id"] or "")
             l_seq = int(r["latest_seq"])
             sup_set: set[int] = set()
             with contextlib.suppress(Exception):
@@ -1929,6 +2693,8 @@ class SQLiteStore:
                     src_list = [int(x) for x in loaded_src if int(x) not in sup_set]
             if not src_list and l_seq not in sup_set:
                 src_list = [l_seq]
+            if sid:
+                out[f"tl:{user_id}:{sid}"] = src_list
             out[f"tl:{user_id}:{subj}:{tg}"] = src_list
         return out
 

@@ -183,7 +183,8 @@ async def test_t1_superseded_fact_item_retires_and_search_renders_update_warning
             ("u_t1",),
         ).fetchone()
 
-    # Historical fact_items (#1, #2, #3) remain tombstoned=0 (only explicit forget tombstones fact_items)
+    # Historical fact_items (#1, #2, #3) remain tombstoned=0
+    # (only explicit forget tombstones fact_items)
     assert fact_rows[0]["tombstoned"] == 0
     assert fact_rows[1]["tombstoned"] == 0
 
@@ -2291,12 +2292,18 @@ async def test_t6_third_person_demotion_unless_explicitly_queried(db_path: Path)
     rachel_general = [
         item
         for item in resp_general.data
-        if item.id.startswith("msg:u_t6:1")
-        or ("美式咖啡" in item.content and "高山乌龙茶" not in item.content)
+        if item.id.startswith("tl:") and "Rachel" in item.content
     ][0]
-    user_general = [item for item in resp_general.data if item.id.startswith("msg:u_t6:2")][0]
+    user_general = [
+        item
+        for item in resp_general.data
+        if item.id.startswith("tl:") and "user" in item.content
+    ][0]
     assert rachel_general.score is not None and user_general.score is not None
     assert rachel_general.score < user_general.score * 0.60
+    # Ordinary dialogue card is NOT demoted
+    rachel_dlg = [item for item in resp_general.data if item.id == "msg:u_t6:1"][0]
+    assert rachel_dlg.score is not None and rachel_dlg.score >= 0.50
 
     resp_rachel = await pipeline.search(
         SearchRequest(query="Rachel 喜欢喝什么饮品", user_id="u_t6", top_k=5)
@@ -2325,29 +2332,30 @@ async def test_t6_third_person_demotion_unless_explicitly_queried(db_path: Path)
         SearchRequest(query="Bob 喜欢喝什么", user_id="u_t6_multi", top_k=5)
     )
     dialogue_hits = [item for item in resp_bob.data if not item.id.startswith("tl:")]
-    assert len(dialogue_hits) >= 2, (
-        f"Expected Rachel and Bob from the same message #1 to be split into 2 independent "
-        f"dialogue cards by (pmid, tier, subject), got {[i.id for i in dialogue_hits]}"
+    assert len(dialogue_hits) == 1, (
+        f"Expected single restored_parent card for turn-pair without splitting, "
+        f"got {[i.id for i in dialogue_hits]}"
     )
-    bob_card = dialogue_hits[0]
-    rachel_card = next(
-        item
-        for item in dialogue_hits
-        if "Rachel" in item.id or "冰美式咖啡" in item.content.split("\n")[-1]
+    card = dialogue_hits[0]
+    assert "Bob" in card.content and "Rachel" in card.content
+    assert "宇治抹茶拿铁" in card.content and "冰美式咖啡" in card.content
+    assert card.score is not None and card.score >= 0.50
+    assert "【注意：本段包含非User本人（系Rachel、Bob）的信息，请勿与User本人混淆】" in card.content
+    assert "【非User本人，系Rachel的信息】" in card.content
+    assert "【非User本人，系Bob的信息】" in card.content
+
+    # Timeline status cards: Bob is queried so Bob's tl card is NOT demoted;
+    # Rachel's tl card is demoted by x0.35
+    bob_tl = next(
+        item for item in resp_bob.data if item.id.startswith("tl:") and "Bob" in item.content
     )
-    assert "Bob" in bob_card.content and "宇治抹茶拿铁" in bob_card.content
-    # Bob's card fact line must NOT mix in Rachel's fact note
-    bob_fact_lines = [
-        line for line in bob_card.content.splitlines() if line.startswith("[提炼事实:")
-    ]
-    assert bob_fact_lines and all("Rachel" not in ln for ln in bob_fact_lines), (
-        f"Bob's card must not mix Rachel's fact into its [提炼事实] line, got:\n{bob_card.content}"
+    rachel_tl = next(
+        item for item in resp_bob.data if item.id.startswith("tl:") and "Rachel" in item.content
     )
-    # Bob is queried so Bob's card is NOT demoted; Rachel is demoted by x0.35
-    assert bob_card.score is not None and rachel_card.score is not None
-    assert rachel_card.score < bob_card.score * 0.60, (
-        f"Expected unqueried Rachel card ({rachel_card.score}) to be demoted by 0.35 "
-        f"relative to queried Bob card ({bob_card.score})"
+    assert bob_tl.score is not None and rachel_tl.score is not None
+    assert rachel_tl.score < bob_tl.score * 0.60, (
+        f"Expected unqueried Rachel timeline card ({rachel_tl.score}) to be demoted by 0.35 "
+        f"relative to queried Bob timeline card ({bob_tl.score})"
     )
 
     # 3. BLOCK-R2-4: Multiple subject='rule' op='add' global instructions ('全局指令/格式约束' &
