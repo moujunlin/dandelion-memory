@@ -1820,11 +1820,10 @@ async def test_fine_grained_slot_latest_and_superseded_hint_with_mixed_turn_guar
 
 @pytest.mark.asyncio
 async def test_v242_context_person_and_revoked_guards(db_path: Path):
-    """v2.4.2 契约回归：
+    """v2.4.2 干净基线契约回归：
     1. B1: apply_person_map_updates 拒绝 from=='user' 的吞并，且拒绝无字面依据的 move_slots；
     2. B2: 用户锚点卡面对超 1000 字符的 assistant 回复时平滑截断保留，短修改轮附带 p_seq-2 草稿；
-    3. B3: 同事落款邮件/案例触发中英双语归属约束，且用户本人姓名绝不被误标为第三方；
-    4. B4: 已撤回偏好命中 Query/Options 时，卡片首部自动注入 [REVOKED PREFERENCE CONSTRAINT]。
+    3. B3: 偏好显式遗忘后物理擦除，检索结果中绝不泄露已删除词（Leak=0），且不依赖选项撞词注入。
     """
     user_id = "user_v242_guards"
     session_id = "sess_v242_01"
@@ -1855,13 +1854,11 @@ async def test_v242_context_person_and_revoked_guards(db_path: Path):
             },
             # Round 2: 短指代修改轮 + 长回复
             {"facts": [], "forget_actions": []},
-            # Round 3: 同事邮件 (无提取出的 other_person 事实，测试 fallback 检测)
-            {"facts": [], "forget_actions": []},
-            # Round 4: 偏好写入与撤回
+            # Round 3: 偏好写入与撤回
             {
                 "facts": [
                     {
-                        "seq": 7,
+                        "seq": 5,
                         "who": "user",
                         "tag": "工具偏好",
                         "fact": "User enjoys using Trello for project tracking",
@@ -1871,8 +1868,8 @@ async def test_v242_context_person_and_revoked_guards(db_path: Path):
                 ],
                 "forget_actions": [
                     {
-                        "trigger_seq": 9,
-                        "batch_seqs_to_tombstone": [7, 8, 9],
+                        "trigger_seq": 7,
+                        "batch_seqs_to_tombstone": [5, 6, 7],
                         "target_existing_tags": ["工具偏好"],
                         "target_keywords": ["trello"],
                         "target_description": "my preference for using Trello",
@@ -1885,7 +1882,7 @@ async def test_v242_context_person_and_revoked_guards(db_path: Path):
     pipeline, store, _, _, _ = build_v2_pipeline(
         db_path=db_path,
         extractor=extractor,
-        reranker=FakeReranker(keyword_scores={"park": 0.9, "shorter": 0.9, "Priya": 0.9}),
+        reranker=FakeReranker(keyword_scores={"park": 0.9, "shorter": 0.9}),
     )
 
     long_draft = (
@@ -1967,40 +1964,7 @@ async def test_v242_context_person_and_revoked_guards(db_path: Path):
         "B2 守卫：用户锚点卡面对超 1000 字符的 assistant 回复应平滑截断保留而非整段丢弃"
     )
 
-    # Round 3 (seq 5 & 6): 同事 Priya 落款邮件
-    await pipeline.add(
-        AddRequest(
-            request_id="req-v242-03",
-            user_id=user_id,
-            session_id=session_id,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Can you help me reply to this email from my colleague?\n\n"
-                        "Hi Ananya,\nI just adopted a golden retriever puppy!\n"
-                        "Warm regards,\nPriya"
-                    ),
-                    "timestamp": 3000,
-                },
-                {
-                    "role": "assistant",
-                    "content": "Here is a warm reply congratulating Priya.",
-                    "timestamp": 3001,
-                },
-            ],
-        )
-    )
-
-    res_priya = await pipeline.search(
-        SearchRequest(user_id=user_id, query="golden retriever puppy Priya", top_k=5)
-    )
-    priya_card = next((c for c in res_priya.data if "golden retriever" in c.content), None)
-    assert priya_card is not None
-    assert "THIRD-PARTY ATTRIBUTION CONSTRAINT" in priya_card.content
-    assert "Priya" in priya_card.content
-
-    # Round 4 (seq 7..10): 偏好写入并显式遗忘 Trello
+    # Round 3 (seq 5..8): 偏好写入并显式遗忘 Trello
     await pipeline.add(
         AddRequest(
             request_id="req-v242-04",
@@ -2039,8 +2003,9 @@ async def test_v242_context_person_and_revoked_guards(db_path: Path):
             top_k=5,
         )
     )
-    assert len(res_revoke.data) > 0
-    assert "[REVOKED PREFERENCE CONSTRAINT:" in res_revoke.data[0].content
-    assert "trello" in res_revoke.data[0].content.casefold()
+    assert all("trello" not in c.content.casefold() for c in res_revoke.data), (
+        "B3 守卫：物理遗忘后检索结果不得泄露已擦除词 Trello"
+    )
+
 
 

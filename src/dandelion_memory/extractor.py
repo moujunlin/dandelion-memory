@@ -44,22 +44,10 @@ _STATE_SUMMARY_PROMPT = """你是 Dandelion Memory v2.4 的状态栏归并整理
    严禁在 merges 列表中输出 "No merge required" 等说明文字。
 2. 明确更新与隐式状态刷新识别：
    - 显式更新：搬家换城市、换工作头衔、行程改期等明确替代；
-   - 隐式状态刷新：当 older_fid 记录了某项指标的旧纪录/旧基准/旧数量/旧额度（如 5K PB 为 27:12、
-     拥有 3 bikes、房贷预批额度/买房预算 $350,000），而 newer_fid 提及该指标已刷新的新纪录/新基准
-     （注意：英文 "with a goal to beat personal best time of 25:50" 中，
-     "personal best time of 25:50" 是指当前最新 PB 已经刷新为 25:50，
-     严禁将 25:50 误读为尚未达成的 goal time！同理还有带齐全部 4 bikes
-     含新买的 gravel bike、银行重新核准后房贷预批额度提高至 $400,000），
-     必须判定为同一事项的状态演进并合并。
+   - 隐式状态刷新：当 older_fid 记录了某项指标的旧纪录/旧基准/旧数量/旧额度，而 newer_fid 提及该指标已刷新的新纪录/新基准、新总数或重新核准的新额度时，必须判定为同一事项的状态演进并合并。
 3. 前后状态完整融合（严禁只照抄半截片断）：
-   - `latest_state` 严禁只照抄或复制 newer_fid 的半截片断！必须将 older_fid 中的完整背景主语
-     （如赛事名称 charity 5K run、银行名称、型号明细）与 newer_fid 的最新数值融合成一句完整结论；
-   - 必须注明旧值演进：对于隐式状态刷新，必须把 newer_fid 中已确立的最新数值写在最前面，
-     并显式在括号中注明从 older_fid 旧数值的演进（例如：
-     Current personal best time in the charity 5K run is 25:50 (updated from previous PB of 27:12),
-     and currently training to beat 25:50；
-     Currently owns 4 bikes in total (updated from 3 bikes after adding a new gravel bike)；
-     房贷预批额度为 $400,000（从 $350,000 更新））。
+   - `latest_state` 严禁只照抄或复制 newer_fid 的半截片断！必须将 older_fid 中的完整背景主语（如活动名称、机构名称、具体类别）与 newer_fid 的最新数值融合成一句完整结论；
+   - 必须注明旧值演进：对于状态刷新，必须把 newer_fid 中已确立的最新数值写在最前面，并显式在括号中注明从 older_fid 旧数值的演进。
 4. 语言与细节保真：`latest_state` 必须与输入槽位保持相同语言（英文槽位必须用英文输出，
    中文用中文），完整保留具体专有名词、数字与核心原因。若无需合并则输出 `{"merges": []}`。
 """
@@ -121,8 +109,8 @@ _SYSTEM_PROMPT = """你是 Dandelion Memory v2.4 的写入侧无状态记忆事�
     {
       "trigger_seq": 35,
       "target_existing_tags": ["爱好/娱乐与文艺"],
-      "target_keywords": ["puzzles", "crosswords"],
-      "target_description": "forget enjoying puzzles and crosswords"
+      "target_keywords": ["<目标关键词>"],
+      "target_description": "<遗忘目标简述>"
     }
   ]
 }
@@ -138,17 +126,15 @@ _SYSTEM_PROMPT = """你是 Dandelion Memory v2.4 的写入侧无状态记忆事�
      只在 `assistant` 消息中被提及、如 `Since you enjoy...` 时才填该 `assistant` 的 `#seq`）。
 3. `"who"`、`"aliases"` 与 `"relations"` 归属准则：
    - `"user"`：用户本人的真实经历、姓名头衔、状态、偏好、日常习惯或工作职责（注意：即使用户
-     在邮件落款或对话中提到自己的真名如 `Sqn Ldr Ananya Rao`，只要是用户本人，`"who"` 必须
+     在邮件落款或对话中提到自己的真名，只要是用户本人，`"who"` 必须
      填 `"user"`，切勿填用户自己的名字以免被误判为他人！）；
-   - `"<具体他人姓名或称呼>"`：属于亲友、同事、上司等他人的独立事实（如 `"Priya"`、`"Rahul"`、
-     `"Mom"`），并在 `"aliases"` 中填写其简称/全称，在 `"relations"` 中填写英文关系词
+   - `"<具体他人姓名或称呼>"`：属于亲友、同事、上司等他人的独立事实，并在 `"aliases"` 中填写其简称/全称，在 `"relations"` 中填写英文关系词
      （如 `["sister"]`, `["spouse"]`, `["mother"]`, `["friend"]`, `["colleague"]`）。
 4. `"is_fiction"` 虚构小说与现实人物/职场文稿分离准则：
    - 仅当内容属于虚构小说、奇幻/科幻故事、剧本设定（如飞船船长、魔龙、虚构小说主角）时，
      才设 `"is_fiction": true`；
-   - 职场邮件、工作总结、值班汇报、以及关于现实同事/军官的专业案例或绩效报告（如提及
-     `Lt. Col. Raghav Sen`, `Lt. Meera Kapoor`, `Sqn Ldr Meera Iyer`, `Major Kavita Sharma`）
-     均非虚构小说，**必须设 `"is_fiction": false`**！其中属于该同事/军官本人的行为与经历，
+   - 职场邮件、工作总结、值班汇报、以及关于现实同事或他人的专业案例或绩效报告
+     均非虚构小说，**必须设 `"is_fiction": false`**！其中属于该同事或他人本人的行为与经历，
      必须将 `"who"` 填为该人物的具体姓名（切勿填 `"user"`）；体现用户本人背景的填 `"who": "user"`！
 5. 标准二级标签词表 `"tag"`（优先从以下 18 个标签中选择）：
    身份/姓名、身份/年龄与生日、身份/教育背景、居住/地点、职业/工作与头衔、职业/技能与技术栈、
@@ -357,8 +343,8 @@ class DashScopeExtractor:
                 "message header [#seq | ...] where that specific fact was stated (NEVER number "
                 "items 1, 2, 3 sequentially, and NEVER merge facts from multiple #seq turns). "
                 "Set 'who'='user' for the user's own real life/rank/preferences (even if the user "
-                "signs their own name like Sqn Ldr Ananya Rao); set 'who' to the specific other "
-                "person's name (e.g. 'Priya', 'Anil', 'Lt. Col. Raghav Sen', 'Lt. Meera Kapoor') "
+                "signs their own name in a message or email); set 'who' to the specific other "
+                "person's name "
                 "when the fact describes a colleague, family member, or third-person case/report "
                 "subject. Only 'tag' uses the Chinese category.]"
             )
@@ -533,7 +519,7 @@ def _normalize_subject_and_tier(
         )
         work_report_keywords = (
             "复盘", "工作总结", "季度汇报", "业绩", "q1", "q2", "q3", "q4",
-            "squadron", "maintenance", "airframe", "hangar", "inspection", "overhaul",
+            "report", "summary", "review", "update",
         )
         is_work_report = any(
             k in key.lower() or k in fact_text.lower() for k in work_report_keywords
