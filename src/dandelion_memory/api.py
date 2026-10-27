@@ -46,6 +46,8 @@ def build_pipeline(settings: Settings) -> MemoryPipeline:
         token_budget=settings.answer_token_budget,
         chunk_target_chars=settings.chunk_target_chars,
         chunk_max_chars=settings.chunk_max_chars,
+        add_extract_budget=settings.add_extract_budget,
+        add_total_budget=settings.add_total_budget,
     )
 
 

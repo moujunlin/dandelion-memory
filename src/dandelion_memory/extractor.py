@@ -66,38 +66,39 @@ _STATE_SUMMARY_PROMPT = """你是 Dandelion Memory v2.4 的状态栏归并整理
 
 _PERSON_RECONCILE_PROMPT = """你是 Dandelion Memory v2.4 的跨人物认人与状态移交整理器。
 输入是当前所有人物状态槽及画像快照。
-请识别跨称谓同人合并（如已明确指认 "my sister" 即 "Priya"）、
+请识别跨称谓同人合并（如已明确指认某个关系称谓对应某位具名人物）、
 误标槽位移交（如错将属于他人的一项槽位标在 user 名下）、
 以及人物指代别名/关系更新。严格输出合法 JSON 对象：
 {
   "merge_persons": [
     {
-      "from": "my sister",
-      "to": "Priya",
-      "aliases": ["my sister Priya"],
-      "relations": ["sister"]
+      "from": "<待合并的旧称谓>",
+      "to": "<目标具名人物>",
+      "aliases": ["<别名>"],
+      "relations": ["<英文关系词>"]
     }
   ],
   "move_slots": [
     {
-      "fid": "F4",
-      "to": "Rachel",
-      "aliases": ["Friend Rachel"],
-      "relations": ["friend"]
+      "fid": "<槽位编号如F99>",
+      "to": "<该槽位实际所属的具名人物>",
+      "aliases": ["<别名>"],
+      "relations": ["<英文关系词>"]
     }
   ],
   "profile_updates": [
     {
-      "person": "Lt. Col. Raghav Sen",
-      "aliases": ["Raghav Sen", "Col. Sen", "Raghav"],
-      "relations": ["case_officer"]
+      "person": "<人物名称>",
+      "aliases": ["<简称或别称>"],
+      "relations": ["<英文关系词>"]
     }
   ]
 }
 核心规则：
 1. 防乱合铁律：泛称（如 "a friend", "my colleague"）若存在多位同关系具名人物且无唯一证据，
-   严禁合并！绝不把具名人物并入匿名泛称。
-2. 仅在证据确凿时输出合并或移交，无变更项输出空数组 `[]`。
+   严禁合并！绝不把具名人物并入匿名泛称；严禁在 merge_persons 中将 "from": "user" 合并给任何他人！
+2. 仅在输入快照中有确凿文本证据时输出合并或移交（move_slots 的目标人物姓名必须在槽位文本中出现），
+   严禁凭空捏造快照中不存在的人名，无变更项必须输出空数组 `[]`。
 """
 
 _SYSTEM_PROMPT = """你是 Dandelion Memory v2.4 的写入侧无状态记忆事实提取器。

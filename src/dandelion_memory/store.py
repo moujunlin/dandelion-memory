@@ -1627,11 +1627,44 @@ class SQLiteStore:
                 )
                 results["profiles_updated"] += 1
 
+        _honorifics = {
+            "lt", "col", "dr", "mr", "mrs", "ms", "prof",
+            "my", "the", "a", "an", "officer", "sqn", "ldr",
+        }
         for mv in (move_slots or []):
             fid = str(mv.get("fid") or mv.get("slot_id") or "").strip()
             to_person = str(mv.get("to") or "").strip()
             if not fid or not to_person:
                 continue
+            tl_pre = conn.execute(
+                "SELECT slot_id, current_state, rendered_summary, latest_seq "
+                "FROM tag_timelines WHERE user_id = ? AND (slot_id = ? OR short_id = ?) "
+                "AND tombstoned = 0",
+                (user_id, fid, fid),
+            ).fetchone()
+            if to_person.casefold() != "user" and tl_pre:
+                name_toks = {
+                    t.casefold()
+                    for t in re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", to_person)
+                    if (
+                        (any("\u4e00" <= ch <= "\u9fff" for ch in t) and len(t) >= 2)
+                        or (len(t) >= 3 and t.casefold() not in _honorifics)
+                    )
+                }
+                if name_toks:
+                    ev_text = (
+                        f"{tl_pre['current_state'] or ''} {tl_pre['rendered_summary'] or ''}"
+                    ).casefold()
+                    l_seq = tl_pre["latest_seq"]
+                    if l_seq is not None:
+                        p_row = conn.execute(
+                            "SELECT content FROM parent_messages WHERE user_id = ? AND seq = ?",
+                            (user_id, int(l_seq)),
+                        ).fetchone()
+                        if p_row and p_row["content"]:
+                            ev_text += " " + str(p_row["content"]).casefold()
+                    if not any(nt in ev_text for nt in name_toks):
+                        continue
             conn.execute(
                 "UPDATE tag_timelines SET subject = ? "
                 "WHERE user_id = ? AND (slot_id = ? OR short_id = ?)",
@@ -1710,6 +1743,8 @@ class SQLiteStore:
             p_from = str(mp.get("from") or "").strip()
             p_to = str(mp.get("to") or "").strip()
             if not p_from or not p_to or p_from.casefold() == p_to.casefold():
+                continue
+            if p_from.casefold() == "user":
                 continue
 
             # NON-BLOCKING-1: 禁止把具名人物并入匿名泛称（如 Alice -> a friend）
