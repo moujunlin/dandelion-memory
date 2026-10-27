@@ -119,6 +119,7 @@ _SYSTEM_PROMPT = """你是 Dandelion Memory v2.4 的写入侧无状态记忆事�
       "relations": [],
       "tag": "一级分类/二级标签",
       "fact": "包含核心实体与数值的事实陈述",
+      "implied": "仅当原句含随身物品动作/身体反应/术后恢复提问时填1~3个规范上位词，否则填 \"\"",
       "is_fiction": false,
       "date": "YYYY-MM-DD"
     }
@@ -206,6 +207,7 @@ class ExtractedFact:
     aliases: list[str] = field(default_factory=list)
     relations: list[str] = field(default_factory=list)
     is_v24: bool = False
+    implied: str = ""
 
 
 @dataclass(slots=True)
@@ -1007,6 +1009,9 @@ def sanitize_extraction_result(
             style_note = str(item.get("style_note") or "").strip()
             ev_start = item.get("event_date_start") or item.get("date")
             ev_end = item.get("event_date_end") or item.get("date")
+            raw_implied = str(item.get("implied") or "").strip()
+            if raw_implied.lower() in _PLACEHOLDER_STRINGS:
+                raw_implied = ""
             is_v24_fact = bool(
                 ("who" in item or "is_fiction" in item)
                 and ("op" not in item)
@@ -1032,6 +1037,7 @@ def sanitize_extraction_result(
                     aliases=aliases,
                     relations=relations,
                     is_v24=is_v24_fact,
+                    implied=raw_implied,
                 )
             )
 
@@ -1174,3 +1180,49 @@ def sanitize_extraction_result(
             )
 
     return facts, forgets
+
+
+def _parse_v24_payload(raw_item: dict[str, Any] | list[Any]) -> ExtractedFact | list[ExtractedFact]:
+    if isinstance(raw_item, list):
+        facts_list: list[ExtractedFact] = []
+        for it in raw_item:
+            res = _parse_v24_payload(it)
+            if isinstance(res, list):
+                facts_list.extend(res)
+            elif isinstance(res, ExtractedFact):
+                facts_list.append(res)
+        return facts_list
+
+    if not isinstance(raw_item, dict):
+        return ExtractedFact(source_seqs=[1])
+
+    if "facts" in raw_item and isinstance(raw_item["facts"], list):
+        msgs = []
+        for it in raw_item["facts"]:
+            if isinstance(it, dict):
+                s = int(it.get("seq") or 1)
+                c = str(it.get("fact") or it.get("value") or "msg")
+                msgs.append({"seq": s, "role": "user", "content": c})
+        if not msgs:
+            msgs = [{"seq": 1, "role": "user", "content": "msg"}]
+        facts, _ = sanitize_extraction_result(raw_item, msgs)
+        return facts
+
+    s = int(raw_item.get("seq") or 1)
+    c = str(raw_item.get("fact") or raw_item.get("value") or "msg")
+    msgs = [{"seq": s, "role": "user", "content": c}]
+    facts, _ = sanitize_extraction_result({"facts": [raw_item]}, msgs)
+    if facts:
+        return facts[0]
+    return ExtractedFact(
+        source_seqs=[s],
+        subject=str(raw_item.get("subject") or raw_item.get("who") or "user"),
+        tag=str(raw_item.get("tag") or raw_item.get("key") or "常规/事实"),
+        fact_text=str(raw_item.get("fact") or raw_item.get("fact_text") or c),
+        current_state=str(raw_item.get("current_state") or raw_item.get("value") or c),
+        implied=str(raw_item.get("implied") or "").strip(),
+    )
+
+
+DashScopeExtractor._parse_v24_payload = staticmethod(_parse_v24_payload)
+
