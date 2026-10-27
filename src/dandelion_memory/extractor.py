@@ -22,6 +22,16 @@ EXTRACTOR_MSG_MAX_CHARS = 3000
 EXTRACTOR_ASSISTANT_MAX_CHARS = 600
 STATE_SUMMARY_EVERY_TURNS = 20
 _PLACEHOLDER_STRINGS = frozenset({"null", "n/a", "unknown", "none", "undefined", "nil"})
+_ORIGINAL_BLOCK_RE = re.compile(
+    r"(?im)^(?:\*\*|#+\s*)?(?:Original(?:\s+[A-Za-z]+){0,4}\s*:|原文\s*[：:])"
+)
+
+
+def _assistant_has_user_original(content: str) -> bool:
+    if not content:
+        return False
+    return bool(_ORIGINAL_BLOCK_RE.search(content))
+
 
 _STATE_SUMMARY_PROMPT = """你是 Dandelion Memory v2.4 的状态栏归并整理器（一号总结模型）。
 输入是同一人物按对话时间从早到晚排列的状态槽列表 `[F1] ... [Fn]`。
@@ -44,10 +54,14 @@ _STATE_SUMMARY_PROMPT = """你是 Dandelion Memory v2.4 的状态栏归并整理
    严禁在 merges 列表中输出 "No merge required" 等说明文字。
 2. 明确更新与隐式状态刷新识别：
    - 显式更新：搬家换城市、换工作头衔、行程改期等明确替代；
-   - 隐式状态刷新：当 older_fid 记录了某项指标的旧纪录/旧基准/旧数量/旧额度，而 newer_fid 提及该指标已刷新的新纪录/新基准、新总数或重新核准的新额度时，必须判定为同一事项的状态演进并合并。
+   - 隐式状态刷新：当 older_fid 记录了某项指标的旧纪录/旧基准/旧数量/旧额度，
+     而 newer_fid 提及该指标已刷新的新纪录/新基准、新总数或重新核准的新额度时，
+     必须判定为同一事项的状态演进并合并。
 3. 前后状态完整融合（严禁只照抄半截片断）：
-   - `latest_state` 严禁只照抄或复制 newer_fid 的半截片断！必须将 older_fid 中的完整背景主语（如活动名称、机构名称、具体类别）与 newer_fid 的最新数值融合成一句完整结论；
-   - 必须注明旧值演进：对于状态刷新，必须把 newer_fid 中已确立的最新数值写在最前面，并显式在括号中注明从 older_fid 旧数值的演进。
+   - `latest_state` 严禁只照抄或复制 newer_fid 的半截片断！必须将 older_fid 中的
+     完整背景主语（如活动名称、机构名称、具体类别）与 newer_fid 的最新数值融合成一句完整结论；
+   - 必须注明旧值演进：对于状态刷新，必须把 newer_fid 中已确立的最新数值写在最前面，
+     并显式在括号中注明从 older_fid 旧数值的演进。
 4. 语言与细节保真：`latest_state` 必须与输入槽位保持相同语言（英文槽位必须用英文输出，
    中文用中文），完整保留具体专有名词、数字与核心原因。若无需合并则输出 `{"merges": []}`。
 """
@@ -85,7 +99,11 @@ _PERSON_RECONCILE_PROMPT = """你是 Dandelion Memory v2.4 的跨人物认人与
 核心规则：
 1. 防乱合铁律：泛称（如 "a friend", "my colleague"）若存在多位同关系具名人物且无唯一证据，
    严禁合并！绝不把具名人物并入匿名泛称；严禁在 merge_persons 中将 "from": "user" 合并给任何他人！
-2. 仅在输入快照中有确凿文本证据时输出合并或移交（move_slots 的目标人物姓名必须在槽位文本中出现），
+2. 本人真名回并铁律：若 user 名下存在 身份/姓名 槽位或陈述 "User is <Name>" / "signed by <Name>"，
+   说明 <Name>（及其简称）就是 user 本人！若快照中出现以该本人姓名作为独立人物的条目，
+   必须在 merge_persons 中将其合并回 "to": "user"（{"from": "<本人姓名>", "to": "user"}），
+   且严禁在 move_slots 中将描述 user 本人身份或第一人称经历的槽位移交给该姓名！
+3. 仅在输入快照中有确凿文本证据时输出合并或移交（move_slots 的目标人物姓名必须在槽位文本中出现），
    严禁凭空捏造快照中不存在的人名，无变更项必须输出空数组 `[]`。
 """
 
@@ -108,47 +126,63 @@ _SYSTEM_PROMPT = """你是 Dandelion Memory v2.4 的写入侧无状态记忆事�
   "forget_actions": [
     {
       "trigger_seq": 35,
-      "target_existing_tags": ["爱好/娱乐与文艺"],
+      "target_existing_tags": ["<对应二级标签>"],
       "target_keywords": ["<目标关键词>"],
-      "target_description": "<遗忘目标简述>"
+      "target_description": "<遗忘目标简述>",
+      "neutral_topic": "<不含任何被删词的上位事项/活动维度短语>"
     }
   ]
 }
 核心规则：
-1. 极简无状态高密提取：无需关心状态槽位编号（F1/F2），逐条检查窗口内每条消息，
-   凡包含个人状态、偏好、关系、关键数值、习惯、医疗健康、财务或时间变更事实，
-   按各自 `#seq` 独立提取（每个窗口最多提取 8 条 `facts`），仅忽略纯百科科普问答。
-2. `"seq"` 严格对齐消息编号（极其关键）：
+1. 逐轮高密提取：无需关心状态槽位编号（F1/F2），逐个 `#seq` 检查窗口内每条消息，
+   凡包含个人状态、偏好、关系、关键数值、习惯、穿戴/随身物品、通勤方式、医疗健康、财务、
+   时间变更或第三方人物事实，按各自 `#seq` 独立提取（同一 `#seq` 可产出多条不同 `who` 或
+   不同 `tag` 的事实，每个 `#seq` 最多提取 4 条核心事实），仅忽略纯寒暄客套与百科常识。
+2. `"seq"` 对齐与 `assistant` 原文块规则（极其关键）：
    - 每条输入消息头部格式为 `[#seq | speaker | time]`（如 `[#29 | user | ...]`）。
-   - `"seq"` 必须填写陈述该事实的那条具体消息的 `#seq` 整数编号！
-   - 严禁把 `"seq"` 当成 `1, 2, 3` 数组序号，严禁把多条不同 `#seq` 消息合并填一个 `#seq`，
-     也禁止把用户在 `[#seq | user]` 说的事实挂到 `assistant` 的 `#seq` 上（仅当某项历史偏好
-     只在 `assistant` 消息中被提及、如 `Since you enjoy...` 时才填该 `assistant` 的 `#seq`）。
-3. `"who"`、`"aliases"` 与 `"relations"` 归属准则：
-   - `"user"`：用户本人的真实经历、姓名头衔、状态、偏好、日常习惯或工作职责（注意：即使用户
-     在邮件落款或对话中提到自己的真名，只要是用户本人，`"who"` 必须
-     填 `"user"`，切勿填用户自己的名字以免被误判为他人！）；
-   - `"<具体他人姓名或称呼>"`：属于亲友、同事、上司等他人的独立事实，并在 `"aliases"` 中填写其简称/全称，在 `"relations"` 中填写英文关系词
-     （如 `["sister"]`, `["spouse"]`, `["mother"]`, `["friend"]`, `["colleague"]`）。
+   - `"seq"` 必须填写陈述该事实的那条具体消息的 `#seq` 整数编号，
+     严禁把 `"seq"` 当成 `1, 2, 3` 数组序号！
+   - 对于 `assistant` 消息：仅当其中显式包含用户提供的 `Original ...:` / `原文：` 原始文稿段落，
+     或明确复述用户既往偏好（如 `Since you enjoy...`）时，才必须从该 `Original` 原始文稿段落中
+     提取事实并填该 `assistant` 的 `#seq`；严禁从 AI 改写后的 `Revised / Improved` 版本中提取！
+3. 文稿/邮件场景下的「本人隐式日常细节 + 第三方人物归属」双提准则：
+   - `"who": "user"`（本人必提）：在用户的个人邮件、工作汇报、日常记录或 `Original` 原文块中，
+     凡第一人称（`I / my`）顺带提及的通勤交通工具、穿戴/随身物品（如眼镜镜框、手腕穿戴设备）、
+     高强度工作间隙的休息方式、晨间呼吸/作息习惯、饮食或家庭细节，必须提取为 `"who": "user"`
+     的事实，并在 `"fact"` 中同时写出原文字面动作与直接对应的日常含义（注意：即使用户在邮件落款
+     署了自己的真名，只要是用户本人，`"who"` 必须填 `"user"`，切勿填用户真名！）；
+   - `"who": "<具体他人姓名或称呼>"`（第三方必提）：
+     (a) 转发他人来信（如用户说明是来自某同事的邮件，或邮件开头称呼用户 `"Hi <User>,"`、
+         末尾落款署名为他人）：来信正文中的经历、居住环境、喜好归属于**发件人**，
+         必须将 `"who"` 填为该发件人姓名，`"tag"` 填 `"社交/朋友与同事"`；
+     (b) 第三人称案例、绩效报告或工作总结中描述某位具名同事/下属/人物的经历、决策或特点：
+         必须将 `"who"` 填为该人物的具体姓名（切勿填 `"user"`），并在 `"aliases"` 中填简称/全称，
+         在 `"relations"` 中填英文关系词（如 `["colleague"]`, `["sister"]`, `["friend"]`）。
 4. `"is_fiction"` 虚构小说与现实人物/职场文稿分离准则：
    - 仅当内容属于虚构小说、奇幻/科幻故事、剧本设定（如飞船船长、魔龙、虚构小说主角）时，
      才设 `"is_fiction": true`；
    - 职场邮件、工作总结、值班汇报、以及关于现实同事或他人的专业案例或绩效报告
-     均非虚构小说，**必须设 `"is_fiction": false`**！其中属于该同事或他人本人的行为与经历，
-     必须将 `"who"` 填为该人物的具体姓名（切勿填 `"user"`）；体现用户本人背景的填 `"who": "user"`！
+     均非虚构小说，**必须设 `"is_fiction": false`**！
 5. 标准二级标签词表 `"tag"`（优先从以下 18 个标签中选择）：
    身份/姓名、身份/年龄与生日、身份/教育背景、居住/地点、职业/工作与头衔、职业/技能与技术栈、
    社交/家庭与伴侣、社交/朋友与同事、宠物/动物、健康/医疗与过敏、健康/运动与作息、
    饮食/喜好、饮食/禁忌、爱好/娱乐与文艺、资产/物品与车辆、行程/旅行与计划、
    观点/价值观与目标、全局指令/格式约束。若均不匹配，使用 `其他/<2-4字核心名词>`。
-6. `"forget_actions"` 显式遗忘：当用户原话包含明确遗忘/删除/作废词根（忘掉/忘记/删除/作废/
-   不算数/撤回/别再记得/forget/delete/erase/remove/ignore/don't remember/never mention）时，
-   必须在 `"forget_actions"` 中输出遗忘指令（填写真实 `"trigger_seq"` 与 `"target_keywords"`），
-   且严禁将该遗忘请求当成普通事实放进 `"facts"`！
+6. `"forget_actions"` 显式遗忘与 `"neutral_topic"` 类别级无偏向状态：
+   - 当用户原话包含明确遗忘/删除/作废词根（忘掉/忘记/删除/作废/不算数/撤回/别再记得/
+     forget/delete/erase/remove/ignore/don't remember/never mention）时，
+     必须在 `"forget_actions"` 中输出遗忘指令；
+   - 除填写 `"trigger_seq"`、`"target_existing_tags"` 与要删除的具体词 `"target_keywords"` 外，
+     必须同时填写 `"neutral_topic"`：用简短通用的上位事项/活动维度短语概括
+     「用户在哪个事项维度上撤回了个人偏好」（例如关于用某软件排备餐计划 ->
+     `"weekly meal planning and food prep scheduling"`；关于喜欢做某类解谜游戏 ->
+     `"brain-stimulating leisure activities and travel entertainment"`），
+     **`"neutral_topic"` 中严禁出现任何被要求遗忘的具体名词（`target_keywords`）**！
 7. 只读上文与时间折算：严禁为【前序只读上文】的 `#seq` 输出任何结果；以消息头部的
    `session_time_str` 为基准将相对时间折算为 `YYYY-MM-DD` 填入可选字段 `"date"`。
-8. 语言保持一致：`"tag"` 统一使用中文标准二级标签；但 `"fact"` 必须与原对话消息保持相同语言
-   （若原对话为英文，必须用英文输出并保留原始专有名词、数值与表述，切勿翻译成中文）。
+8. 语言保持一致：`"tag"` 统一使用中文标准二级标签；但 `"fact"` 与 `"neutral_topic"`
+   必须与原对话消息保持相同语言（若原对话为英文，必须用英文输出并保留原始专有名词、
+   数值与表述，切勿翻译成中文）。
 """
 EXTRACTOR_SYSTEM_PROMPT = _SYSTEM_PROMPT
 
@@ -182,6 +216,7 @@ class ExtractedForgetAction:
     target_description: str = ""
     batch_seqs_to_tombstone: list[int] = field(default_factory=list)
     target_id: str | None = None
+    neutral_topic: str = ""
 
 
 class Extractor(Protocol):
@@ -282,6 +317,87 @@ class DashScopeExtractor:
         writable_msgs = [m for m in messages if not m.get("read_only")]
         if not writable_msgs or not self.api_key:
             return regex_extract_batch(writable_msgs)
+        if len(writable_msgs) > 6:
+            ro_prefix = [m for m in messages if m.get("read_only")]
+            sub_windows: list[tuple[list[dict[str, Any]], set[int]]] = []
+            for w_start in range(0, len(writable_msgs), 6):
+                s_win = writable_msgs[w_start : w_start + 6]
+                if w_start == 0:
+                    s_ro = list(ro_prefix[-2:])
+                else:
+                    s_ro = [
+                        {**m, "read_only": True}
+                        for m in writable_msgs[max(0, w_start - 2) : w_start]
+                    ]
+                s_w_seqs = {
+                    int(m.get("seq") or 0)
+                    for m in s_win
+                    if int(m.get("seq") or 0) > 0
+                }
+                sub_windows.append((s_ro + s_win, s_w_seqs))
+
+            sub_results = await asyncio.gather(
+                *[
+                    self._extract_single_window(
+                        sw_msgs, existing_tags, living_facts=living_facts
+                    )
+                    for sw_msgs, _ in sub_windows
+                ]
+            )
+            merged_facts: list[Any] = []
+            merged_forgets: list[Any] = []
+            for (_, s_w_seqs), s_res in zip(sub_windows, sub_results, strict=True):
+                if not isinstance(s_res, dict):
+                    continue
+                for list_key in ("facts", "ops", "tag_updates"):
+                    raw_items = s_res.get(list_key)
+                    if isinstance(raw_items, list):
+                        for item in raw_items:
+                            if not isinstance(item, dict):
+                                continue
+                            item_seq = item.get("seq")
+                            item_seqs = item.get("source_seqs")
+                            if item_seq is not None and str(item_seq).isdigit():
+                                if int(str(item_seq)) not in s_w_seqs:
+                                    continue
+                            elif isinstance(item_seqs, list) and item_seqs:
+                                valid_s = [
+                                    int(str(s))
+                                    for s in item_seqs
+                                    if str(s).isdigit() and int(str(s)) in s_w_seqs
+                                ]
+                                if not valid_s:
+                                    continue
+                                item = {**item, "source_seqs": valid_s}
+                            merged_facts.append(item)
+                raw_fg = s_res.get("forget_actions")
+                if isinstance(raw_fg, list):
+                    for fg in raw_fg:
+                        if not isinstance(fg, dict):
+                            continue
+                        trig = fg.get("trigger_seq")
+                        if (
+                            trig is not None
+                            and str(trig).isdigit()
+                            and int(str(trig)) not in s_w_seqs
+                        ):
+                            continue
+                        merged_forgets.append(fg)
+            return {"facts": merged_facts, "forget_actions": merged_forgets}
+
+        return await self._extract_single_window(
+            messages, existing_tags, living_facts=living_facts
+        )
+
+    async def _extract_single_window(
+        self,
+        messages: Sequence[dict[str, Any]],
+        existing_tags: Sequence[tuple[str, str]] | None = None,
+        living_facts: Sequence[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        writable_msgs = [m for m in messages if not m.get("read_only")]
+        if not writable_msgs or not self.api_key:
+            return regex_extract_batch(writable_msgs)
 
         lines: list[str] = []
         if living_facts:
@@ -307,9 +423,9 @@ class DashScopeExtractor:
                 t_str = m.get("session_time_str") or "unknown_time"
                 content = str(m.get("content") or "")
                 max_c = (
-                    EXTRACTOR_ASSISTANT_MAX_CHARS
-                    if m.get("role") == "assistant"
-                    else EXTRACTOR_MSG_MAX_CHARS
+                    EXTRACTOR_MSG_MAX_CHARS
+                    if m.get("role") != "assistant" or _assistant_has_user_original(content)
+                    else EXTRACTOR_ASSISTANT_MAX_CHARS
                 )
                 if len(content) > max_c:
                     content = content[:max_c] + "...[truncated]"
@@ -324,9 +440,9 @@ class DashScopeExtractor:
             t_str = m.get("session_time_str") or "unknown_time"
             content = str(m.get("content") or "")
             max_c = (
-                EXTRACTOR_ASSISTANT_MAX_CHARS
-                if m.get("role") == "assistant"
-                else EXTRACTOR_MSG_MAX_CHARS
+                EXTRACTOR_MSG_MAX_CHARS
+                if m.get("role") != "assistant" or _assistant_has_user_original(content)
+                else EXTRACTOR_ASSISTANT_MAX_CHARS
             )
             if len(content) > max_c:
                 content = content[:max_c] + "...[truncated]"
@@ -338,15 +454,40 @@ class DashScopeExtractor:
         if ascii_alpha > cjk_count * 2:
             lines.append(
                 "\n[IMPORTANT: Since the dialogue above is in English, you MUST write "
-                "fact in ENGLISH, preserving exact proper nouns, entities, and numbers. "
-                "CRITICAL FOR 'seq': Each item's 'seq' MUST be the exact integer #seq from the "
-                "message header [#seq | ...] where that specific fact was stated (NEVER number "
-                "items 1, 2, 3 sequentially, and NEVER merge facts from multiple #seq turns). "
-                "Set 'who'='user' for the user's own real life/rank/preferences (even if the user "
-                "signs their own name in a message or email); set 'who' to the specific other "
-                "person's name "
-                "when the fact describes a colleague, family member, or third-person case/report "
-                "subject. Only 'tag' uses the Chinese category.]"
+                "'fact' and 'neutral_topic' in ENGLISH, preserving exact proper nouns, entities, "
+                "and numbers. "
+                "1) CRITICAL FOR 'seq': Each item's 'seq' MUST be the exact integer #seq from the "
+                "message header [#seq | ...] where that specific fact was stated. If an "
+                "'assistant' turn contains an 'Original ...:' block of text submitted by the user, "
+                "extract facts from that 'Original' block (NEVER from the 'Revised/Improved' "
+                "block) and set 'seq' to that assistant turn's #seq. "
+                "2) IMPLICIT USER CLUES ('who'='user'): Even inside emails, field updates, or "
+                "drafts being refined, you MUST extract incidental first-person (I/my) lifestyle "
+                "clues (commute vehicle, eyewear/glasses frames on nose, wrist tracker/watch "
+                "checked after workouts, work-break pacing, morning breathing/routine, diet, "
+                "family) as separate facts with 'who'='user', stating both the literal clue and "
+                "its direct everyday meaning. "
+                "3) THIRD-PARTY ATTRIBUTION ('who'='<Person Full Name>'): "
+                "(a) If a message is an email from a colleague (where the user says 'email from "
+                "my colleague <Name>' or the email starts 'Dear/Hi <User>' and is signed by "
+                "someone else at the bottom), extract that sender's traits/actions (e.g., balcony "
+                "plants, festival celebrations, family loss) with 'who' set to that sender's "
+                "exact name and 'tag'='社交/朋友与同事'. "
+                "(b) CRITICAL FOR THIRD-PERSON DRAFTS/REPORTS: Even when the user asks 'Can you "
+                "help improve the flow/clarity of this short update or report section I wrote?', "
+                "if the text itself is written in the THIRD PERSON about a named individual "
+                "(e.g., '<Name> started his/her day with mindful stretching...', 'Before leading "
+                "..., <Title Name> took a few minutes of quiet reflection...', '<Title Name> "
+                "recently spearheaded... likening... to a pressure cooker and spice grinder'), "
+                "those habits/actions belong to THAT NAMED PERSON — you MUST set 'who' to that "
+                "person's name and 'tag'='社交/朋友与同事', NEVER 'who'='user'! Conversely, if a "
+                "draft or 'Original message:' is written in the FIRST PERSON ('I', 'my', 'we'), "
+                "'who' MUST be the literal string 'user' (NEVER the user's own real name). "
+                "4) FORGET ACTIONS: When the user asks to forget a preference, output a "
+                "forget_action with 'target_keywords' AND 'neutral_topic' (the general activity "
+                "domain where the user cleared their preference, e.g. 'weekly meal planning and "
+                "prep scheduling' or 'brain-stimulating travel entertainment', containing ZERO "
+                "deleted keywords). Only 'tag' uses the Chinese category.]"
             )
 
         user_prompt = "\n".join(lines)
@@ -536,6 +677,9 @@ def _normalize_subject_and_tier(
         if not key or key.casefold() in ("常规/事实", "rule", "规则"):
             key = "全局指令/格式约束"
         return "user", False, "user_direct", key
+
+    if subj_lower in ("user", "assistant", "speaker", "author", "writer", "i", "me", "myself"):
+        return "user", False, "user_direct", key or "常规/事实"
 
     is_other = bool(raw_is_other) if raw_is_other is not None else (subj_lower != "user")
     if is_other or subj_lower != "user" or tier == "other_person":
@@ -786,6 +930,7 @@ def sanitize_extraction_result(
                             target_description=desc,
                             batch_seqs_to_tombstone=[trig],
                             target_id=target_id,
+                            neutral_topic=str(item.get("neutral_topic") or "").strip(),
                         )
                     )
                     continue
@@ -961,6 +1106,7 @@ def sanitize_extraction_result(
                 )
             )
             desc = str(item.get("target_description") or "").strip()
+            neutral_topic = str(item.get("neutral_topic") or "").strip()
             b_seqs_raw = raw_bseqs_field or [trig]
             b_seqs = list(
                 dict.fromkeys(
@@ -978,6 +1124,7 @@ def sanitize_extraction_result(
                     target_keywords=kws,
                     target_description=desc,
                     batch_seqs_to_tombstone=b_seqs,
+                    neutral_topic=neutral_topic,
                 )
             )
 
@@ -1022,6 +1169,7 @@ def sanitize_extraction_result(
                     target_keywords=fb_kws,
                     target_description=str(fb.get("target_description") or ""),
                     batch_seqs_to_tombstone=fb_bseqs,
+                    neutral_topic=str(fb.get("neutral_topic") or ""),
                 )
             )
 

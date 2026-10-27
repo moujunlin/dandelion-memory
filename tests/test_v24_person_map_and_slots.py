@@ -1116,8 +1116,8 @@ def test_state_summary_prompt_fusion_and_implicit_refresh_contract():
     ), "_STATE_SUMMARY_PROMPT 必须明确包含「隐式刷新」或「隐式状态刷新」指令规则"
 
     # 包含打破 PB、数量增加、额度变更等具体场景指引
-    has_pb_metric = "PB" in prompt or "5K" in prompt
-    has_amount_or_count_metric = any(kw in prompt for kw in ("额度", "预算", "数量", "bikes"))
+    has_pb_metric = any(kw in prompt for kw in ("PB", "最佳成绩", "数值更新", "新纪录"))
+    has_amount_or_count_metric = any(kw in prompt for kw in ("额度", "预算", "数量"))
     assert has_pb_metric and has_amount_or_count_metric, (
         "_STATE_SUMMARY_PROMPT 必须包含打破 PB 与额度/数量变更等隐式状态刷新场景指引"
     )
@@ -1873,6 +1873,9 @@ async def test_v242_context_person_and_revoked_guards(db_path: Path):
                         "target_existing_tags": ["工具偏好"],
                         "target_keywords": ["trello"],
                         "target_description": "my preference for using Trello",
+                        "neutral_topic": (
+                            "using Trello for project tracking and sprint management tools"
+                        ),
                     }
                 ],
             },
@@ -2004,8 +2007,14 @@ async def test_v242_context_person_and_revoked_guards(db_path: Path):
         )
     )
     assert all("trello" not in c.content.casefold() for c in res_revoke.data), (
-        "B3 守卫：物理遗忘后检索结果不得泄露已擦除词 Trello"
+        "B3 守卫：物理遗忘后检索结果不得泄露已擦除词 Trello（含 neutral_topic 物理净化）"
     )
+    assert any(
+        "cleared their previous specific preference" in c.content
+        and "project tracking" in c.content
+        for c in res_revoke.data
+    ), "v2.5 守卫：物理遗忘后应召回不含被删词的类别级无偏向状态卡"
+
 
 
 

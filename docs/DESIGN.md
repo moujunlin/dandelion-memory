@@ -252,3 +252,70 @@ flowchart TD
   1. **检索排序表示与 Reader 阅读表示解耦**：消融实验显示，去掉卡片上的合成提示头（`A4`）或置顶加分（`A2`）时，`R@10` 下降但 `MCQ` 反而上升（`48% -> 52%~56%`）。v3 需将“给检索/Reranker 用的结构化信号”与“最终返回给下游 Reader 的干净上下文”解耦，避免不完整的合成小字和置顶摘要卡喧宾夺主、挤压 Top-K 原文窗口。
   2. **完整对话轮（Turn-Pair）与邻近上下文窗口还原**：解决 `>600` 字长消息仅返回孤立 `raw_slice` 以及命中 `user` 提问句但缺少紧邻 `assistant` 回复/前后轮上下文的问题。
   3. **遗忘控制的脱敏墓碑提示（Forget Tombstone Signal）**：在保持 `Zero-Leak@100` 不泄露被删具体值的前提下，让下游 Reader 明确感知“该主题旧偏好已被用户撤销”，将 `Zero-Leak@100 (83.3%)` 转化为 `Forget MCQ` 得分。
+
+---
+
+## 八、v2.5 入库提炼层（Extractor）无过拟合结构性重构设计
+
+### 8.1 背景与归因（基于 `5c88ce2` 干净基线）
+
+在剥除所有针对评测集特征的过拟合代码（`5c88ce2`：移除 `_pack_with_forget_guard` 中拿墓碑词与 `request.options` 撞词的逻辑、移除 `_COLLEAGUE_SIGNOFF_RE` / `_CASE_STUDY_OFFICER_RE` / `_format_third_party_warning`、移除 `extractor.py` 中所有测试集人名与数值示例）后，全套 `gpt-4o-mini` 干净基线暴露出的问题全部收敛于**入库提炼（`Extractor`）层**：
+- 下游检索与卡片组装基建（`person_profiles` 人物表、`backfill_raw_slices_for_seq`、对话卡非本人提示头 `【注意：本段包含非User本人…】`、`[提炼事实]` 摘要、物理墓碑化 `Leak = 0`）均已在 `pipeline.py` 与 `store.py` 中完备，**检索打分与卡片拼接逻辑无需改动**。
+- 上游提炼层的 4 个结构性缺陷导致下游基建断供：
+  1. **窗口过大（12 条消息）+ 条数硬上限（每窗口最多 8 条）**：长对话窗口内大量轮次提炼出 `0` 条 `fact_item`；
+  2. **`assistant` 一刀切 600 字截断 + 禁提规则**：当用户仅发短句请求润色、而将 `Original:` 原始文稿放在 `assistant` 回复中时，原文被截断且禁止提炼；
+  3. **文稿/邮件场景下漏提本人隐式日常细节与第三方人物归属**：润色工作汇报或邮件时漏提第一人称（`I / my`）生活细节，或未区分邮件发件人（同事）与收件人（用户本人）；
+  4. **显式遗忘（`forget_actions`）只做物理删词，缺失「该事项类别已无个人偏向」的状态表达**：导致下游在回答该事项问题时，强行拿用户未删除的其他背景（如职业、饮食文化）去凑有偏向的答案。
+
+### 8.2 修改边界（Blast Radius 契约）
+
+| 类别 | 模块 / 函数 | 边界约束 |
+| :--- | :--- | :--- |
+| **允许修改（In-Scope）** | 1. `extractor.py`: `_SYSTEM_PROMPT`、`ExtractedForgetAction`、`DashScopeExtractor.extract()`、`sanitize_extraction_result()`<br>2. `text.py`: `regex_extract_batch()`（对齐 `neutral_topic` 默认空值）<br>3. `pipeline.py`: `add()` 入库阶段的滑窗步长（`12 -> 6`）与 `valid_forgets` 执行墓碑化后的「类别级无偏向状态」写入 | 仅修改写入侧（`/add`）的提炼窗口、Prompt 通用规则及遗忘后的脱敏状态槽写入；严禁引入任何测试集专有名词或数值。 |
+| **严禁触碰（Out-of-Scope）** | - `_search_v2` 检索召回、RRF、Reranker、分数加权与人物降权门控<br>- `_restore_parent_cards` 与 `_pack_with_forget_guard`（严禁读取 `request.options` 撞词或加正则警告） | **检索侧代码保持 100% 干净不动**。 |
+
+### 8.3 四项核心改造与副作用防护（融合 DeepSeek & Codex 会诊结论）
+
+#### 改造 1：提炼滑窗缩窄（`12 -> 6` 条消息）+ 保留跨轮只读上文（`2` 条）+ 取消窗口 8 条硬上限
+- **滑窗切分（`pipeline.py`）**：
+  - 将 `active_batch` 单窗直通阈值从 `<= 16` 调为 `<= 6`，长会话滑窗步长从 `12` 条（6 轮）缩为 `6` 条（3 轮问答）；
+  - 每个窗口前保留 `2` 条 `read_only: True` 的前序消息（`active_batch[max(0, w_start - 2) : w_start]`），防止缩窗切断跨轮指代（如 `"make it shorter"`）。
+- **逐轮覆盖与防噪准入（`extractor.py`）**：
+  - 删除 `_SYSTEM_PROMPT` 中「每个窗口最多提取 8 条 `facts`」的硬限制；
+  - 改为要求**逐个 `#seq` 检查窗口内每条消息**，提取所有具有明确主体归属、可验证的具体个人事实或第三方人物事实（同一 `#seq` 可产出多条不同 `who` 或不同 `tag` 的独立事实，单个 `#seq` 最多提取 4 条核心事实）；
+  - 明确防噪边界：纯寒暄客套、百科常识问答、以及 AI 自行生成的通用建议一律不提。
+
+#### 改造 2：`assistant` 消息仅对「行首显式包含用户 `Original` 原文块」放开截断与提炼
+- **动态截断（`extractor.py`）**：
+  - 新增行首锚定正则 `_ORIGINAL_BLOCK_RE = re.compile(r"(?im)^(?:\*\*|#+\s*)?(?:Original(?:\s+[A-Za-z]+){0,4}\s*:|原文\s*[：:])")`：仅当 `assistant` 消息在行首（或加粗/标题开头）显式包含 `Original ...:` / `原文：` 原文块标记时，才判定为包含用户原始文稿；
+  - 若命中，该条 `assistant` 消息在送入 Extractor 时使用 `EXTRACTOR_MSG_MAX_CHARS (3000)` 保留完整原文段落；否则一律维持 `EXTRACTOR_ASSISTANT_MAX_CHARS (600)` 截断。
+- **提炼边界铁律（防 AI 自生成内容污染）**：
+  - 在 `_SYSTEM_PROMPT` 中规定：对于 `assistant` 消息，**仅当其中包含显式标注的用户 `Original` 原始文稿段落时，才允许从该 `Original` 原文段落中提炼事实（标注该 `assistant` 的 `#seq`）**；严禁从 AI 改写后的 `Revised / Improved / Polished` 版本或 AI 的礼貌建议中提炼事实。
+
+#### 改造 3：文稿/邮件场景下的「本人隐式细节 + 第三方归属」双提与同轮多主体（1-to-N）隔离
+- **本人隐式日常细节必提（`who="user"`）**：
+  - 当用户请 AI 润色个人邮件、工作汇报或日常记录（含 `Original` 原文块）时，凡第一人称（`I / my`）顺带提及的**通勤方式、穿戴/随身物品（如眼镜框、腕表/手环）、工作间隙休息方式、晨间/日常作息习惯、饮食与家庭细节**，必须提取为 `who="user"` 的 `fact_item`，并在 `fact` 中同时写出字面动作与直接对应的日常含义（如扶鼻梁上的细金属镜框 -> 佩戴金属框眼镜；体能训练后看手腕 -> 使用腕部穿戴设备关注运动数据）。
+- **第三方人物归属必提（`who="<具体他人姓名>"`）**：
+  - **邮件收发件人分离**：当用户转发他人来信（如 `"email from my colleague X"` 或邮件末尾落款 `"Warm regards / Best / Sincerely, X"`，开头称呼 `"Hi <User>,"`）时，开头称呼是用户本人，而邮件正文中叙述的近况、环境、喜好归属于**发件人 `X`**，必须提为 `who="X"`、`tag="社交/朋友与同事"`；
+  - **第三人称案例/报告分离**：当文稿以第三人称描述某位具名同事、下属或他人的案例、工作表现或爱好时，必须提为 `who="<该人物姓名>"`、`tag="社交/朋友与同事"`。
+- **同轮多主体（1-to-N）回填安全与去重**：
+  - 允许同一 `#seq` 同时产出 `who="user"` 与 `who="<他人姓名>"` 的多条 `fact_item`（在 `sanitize_extraction_result` 中按 `(seq, subject, tag, current_state)` 去重，且滑窗间无重叠可写 `seq`）；
+  - 下游 `pipeline.py` 已有守卫保持不变：若同轮仅含唯一第三方主体，自动回填 `raw_slice`；若同轮混合了 `user` 与第三方事实，`raw_slice` 保持 `user` 不被覆盖，同时对话卡通过 `live_facts` 自动展示非本人提示头并在每条 `[提炼事实]` 中分别标注主体。
+
+#### 改造 4：显式遗忘（`forget_actions`）在 Stage 2 预构建并脱敏「类别级无偏向状态（`neutral_topic`）」，按对应业务分类与 `seq = 0` 物理隔离入库
+- **Schema 扩展（`extractor.py`）**：
+  - `ExtractedForgetAction` 新增字段 `neutral_topic: str = ""`；
+  - `_SYSTEM_PROMPT` 要求输出 `forget_actions` 时，除填写要删除的具体词 `target_keywords` 和所属标准标签 `target_existing_tags` 外，必须同时输出 `"neutral_topic"`：用简短通用短语概括**用户撤回偏好所属的上位事项/活动维度**（如 `"meal planning, prep scheduling, and kitchen workflow"`、`"brain-stimulating entertainment and activities for travel"`），**严禁在 `neutral_topic` 中包含任何被要求遗忘的具体对象词**。
+- **Stage 2 预脱敏与 Batch Embedding（闭合 Stage 2/3 异步与事务边界）**：
+  - `pipeline.add()` 在 Stage 1 开头（line 473）已加载完整的 `living_facts` 快照，且拥有当前批次全部 `batch_records` 与刚提取出的 `prepared_facts`；
+  - 在 **Stage 2（调用 `await self.embedder.embed(all_embed_inputs)` 之前）** 遍历 `valid_forgets` 时，同步执行确定性脱敏函数 `_sanitize_neutral_topic(raw_topic, target_keywords, forget_msg_content, batch_records, living_facts)`：
+    1. 汇总禁止词表：`target_keywords` + `extract_keywords_from_target(extract_forget_target(forget_msg_content))` + `batch_records` / `living_facts` 中命中 `target_keywords` 的特定词及其词干（`_stem_en_word`）、大小写与连字符拆分词；
+    2. 从 `raw_topic` 中按词边界剔除所有命中禁止词表的 token；若清洗后有效词少于 2 个，则直接查静态常量字典 `_TAG_NEUTRAL_TOPIC_FALLBACK`（将 18 个标准二级标签映射到纯通用英文短语，绝不含任何用户特定词）；
+    3. 构造无偏向状态文本 `neutral_state_text`：
+       `User has withdrawn and cleared personal preferences regarding {clean_topic}; for questions about {clean_topic}, provide a neutral, general recommendation without personal bias (do not force-fit other background traits).`
+    4. **在 Stage 2 将该状态的 `embed_input` 直接加入 `all_embed_inputs` 统一完成单次批量 Embedding**，将结果存入 `vf["neutral_vec"]`，Stage 3 事务内零异步调用。
+- **Stage 3 非全局分类落库 + `seq = 0, parent_msg_id = None` 绝对隔离（杜绝置顶挤占与母消息拉取泄露）**：
+  - **强制排除 `全局指令/格式约束`**：取 `fa.target_existing_tags[0]` 作为状态卡的 `tag`；若为空或等于 `"全局指令/格式约束"`，强制映射为 `"其他/偏好撤回"`，确保 `is_global_constraint` 恒为 `False`，绝不无条件霸占 Top-K 置顶位；
+  - **`seq = 0, parent_msg_id = None` 断绝原话拉取**：在 Stage 3 完成 `execute_forget_action` 物理墓碑化后，写入的无偏向 `fact_item` 与 `timeline_summary` 统一设置 **`parent_msg_id = None, seq = 0`**（库内真实消息 `seq >= 1`，不存在 `seq = 0` 的母消息），从根本上杜绝 `_pull_timeline_evidence` 或 `_restore_parent_cards` 顺着该状态槽拉出 `trigger_seq` 或 `trigger_seq + 1` 的任何原话切片。
+
+
