@@ -320,3 +320,25 @@ def test_add_module_b_llm_timeout_and_invalid_json_fallback_to_regex(settings, d
     )
     assert s_card.status_code == 200
     assert all("备用门禁卡" not in item["content"] for item in s_card.json()["data"])
+
+
+def test_build_pipeline_uses_separate_llm_api_key(tmp_path) -> None:
+    from dandelion_memory.api import build_pipeline
+    from dandelion_memory.config import Settings
+
+    s1 = Settings(
+        memory_api_key="test-memory-api-key-123456",
+        dashscope_api_key="dashscope-key-for-emb",
+        llm_api_key="relay-key-for-gpt4o-mini",
+        llm_base_url="https://aihubmix.com/v1",
+        llm_model="gpt-4o-mini",
+        sqlite_path=str(tmp_path / "sep.sqlite3"),
+    )
+    p1 = build_pipeline(s1)
+    try:
+        assert p1.embedder.api_key == "dashscope-key-for-emb"
+        assert p1.reranker.api_key == "dashscope-key-for-emb"
+        assert p1.extractor.api_key == "relay-key-for-gpt4o-mini"
+        assert p1.extractor.model == "gpt-4o-mini"
+    finally:
+        p1.store.close()

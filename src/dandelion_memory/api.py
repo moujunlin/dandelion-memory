@@ -23,7 +23,7 @@ def build_pipeline(settings: Settings) -> MemoryPipeline:
         batch_size=settings.embedding_batch_size,
     )
     extractor = DashScopeExtractor(
-        api_key=settings.dashscope_api_key,
+        api_key=settings.llm_api_key or settings.dashscope_api_key,
         base_url=settings.llm_base_url,
         model=settings.llm_model,
         timeout=settings.llm_timeout,

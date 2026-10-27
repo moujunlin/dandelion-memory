@@ -363,7 +363,7 @@ class DashScopeExtractor:
             )
 
         user_prompt = "\n".join(lines)
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
@@ -371,8 +371,9 @@ class DashScopeExtractor:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
-            "enable_thinking": False,
         }
+        if "qwen" in self.model.lower() or "dashscope" in self.base_url.lower():
+            payload["enable_thinking"] = False
 
         for _ in range(self.max_retries + 1):
             client = self._get_client()
@@ -436,7 +437,7 @@ class DashScopeExtractor:
             st = str(lf.get("current_state") or lf.get("state") or "")
             t_part = f", time={t_str}" if t_str else ""
             lines.append(f"[{sid}] (seq=#{seq}{t_part}) {subj} | {key}: {st}")
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": _STATE_SUMMARY_PROMPT},
@@ -444,8 +445,9 @@ class DashScopeExtractor:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
-            "enable_thinking": False,
         }
+        if "qwen" in self.model.lower() or "dashscope" in self.base_url.lower():
+            payload["enable_thinking"] = False
         client = self._get_client()
         try:
             resp = await client.post(
@@ -469,7 +471,7 @@ class DashScopeExtractor:
     ) -> dict[str, Any]:
         if not self.api_key:
             return {"merge_persons": [], "move_slots": [], "profile_updates": []}
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": _PERSON_RECONCILE_PROMPT},
@@ -477,8 +479,9 @@ class DashScopeExtractor:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
-            "enable_thinking": False,
         }
+        if "qwen" in self.model.lower() or "dashscope" in self.base_url.lower():
+            payload["enable_thinking"] = False
         client = self._get_client()
         try:
             resp = await client.post(

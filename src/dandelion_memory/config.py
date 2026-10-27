@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         default="storage-token-for-default-config-123456", min_length=32
     )
     dashscope_api_key: str = ""
+    llm_api_key: str = ""
     sqlite_path: str = "dandelion_v2.sqlite3"
     embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     embedding_model: str = "text-embedding-v4"
