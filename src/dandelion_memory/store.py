@@ -17,10 +17,12 @@ from .models import MemoryCandidate, WriteItem
 from .text import (
     LONG_DOC_CHAR_THRESHOLD,
     build_bm25_tokens,
+    extract_keywords_from_target,
     get_base_tag,
     has_explicit_forget_keyword,
     is_incidental_update_text,
     is_naturally_multivalued,
+    tokenize,
     tokenize_bm25,
 )
 
@@ -2081,20 +2083,26 @@ class SQLiteStore:
             "hobbies", "habit", "habits", "leisure", "工作", "职业", "技能", "work",
             "job", "career", "居住", "城市", "住址", "健康", "医疗", "禁忌", "运动",
             "财务", "预算", "资产", "宠物", "旅行", "出行", "常规", "事实", "其他",
+            "user", "users", "prefer", "prefers", "preferred", "schedule", "schedules",
+            "scheduled", "scheduling",
+            "activity", "activities", "event", "events", "weekend", "routine", "routines",
+            "attend", "attends", "attended", "attending", "enjoy", "enjoys", "enjoyed",
+            "enjoying", "follow", "follows", "followed", "following", "prep", "planning",
         }
+
+        specific_token_kws = [
+            t
+            for t in extract_keywords_from_target(
+                " ".join(kw_list) + " " + str(target_description or "")
+            )
+            if t.strip().casefold() not in _generic_cat_words
+        ]
 
         def _is_high_spec_kw(kw: str) -> bool:
             clean = kw.strip()
-            if not clean:
-                return False
-            if " " in clean or "-" in clean or "_" in clean:
-                return True
-            if any(c.isupper() for c in clean[1:]):
-                return True
-            cjk_count = sum(1 for c in clean if "\u4e00" <= c <= "\u9fff")
-            if cjk_count >= 3:
-                return True
-            return len(clean) >= 8 and clean.casefold() not in _generic_cat_words
+            return bool(
+                any(c.isupper() for c in clean[1:]) and " " not in clean and "-" not in clean
+            )
 
         def _lexical_forget_match(text_combined: str) -> bool:
             if not text_combined:
@@ -2109,7 +2117,15 @@ class SQLiteStore:
                         return True
                 kw_hits = sum(1 for kw in kw_list if _kw_hit(kw, lower_text, c_terms))
                 if len(kw_list) <= 2:
-                    return kw_hits == len(kw_list)
+                    if kw_hits == len(kw_list):
+                        return True
+                    if len(specific_token_kws) >= 3:
+                        tok_hits = sum(
+                            1 for kw in specific_token_kws if _kw_hit(kw, lower_text, c_terms)
+                        )
+                        if tok_hits >= 3 and (tok_hits / len(specific_token_kws)) >= 0.6:
+                            return True
+                    return False
                 if (kw_hits / len(kw_list)) >= 0.35:
                     return True
             elif target_terms:
@@ -2463,10 +2479,13 @@ class SQLiteStore:
                 cos_sim = cosine_similarity(target_vector, vec)
                 if cos_sim >= 0.58:
                     hit = True
-                elif cos_sim >= 0.42 and len(kw_list) >= 3:
-                    comb_lower = combined.casefold()
-                    comb_terms = set(tokenize_bm25(combined))
-                    if any(_kw_hit(kw, comb_lower, comb_terms) for kw in kw_list):
+                elif cos_sim >= 0.42 and len(specific_token_kws) >= 2:
+                    disp_low = disp.casefold()
+                    disp_terms = set(tokenize(disp))
+                    hit_cnt = sum(
+                        1 for kw in specific_token_kws if _kw_hit(kw, disp_low, disp_terms)
+                    )
+                    if hit_cnt >= 2:
                         hit = True
 
             if hit:

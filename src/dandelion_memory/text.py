@@ -161,6 +161,19 @@ _EN_STOPWORDS = {
     "yourselves",
 }
 
+_FORGET_STOPWORDS = _EN_STOPWORDS | {
+    "user",
+    "users",
+    "prefer",
+    "prefers",
+    "preferred",
+    "preference",
+    "preferences",
+    "not",
+    "use",
+    "using",
+}
+
 _FORGET_PATTERNS = (
     re.compile(r"(?is)\b(?:please\s+)?forget(?:\s+about|\s+that)?\s+(.+)$"),
     re.compile(
@@ -432,6 +445,10 @@ def tokenize_bm25(text: str) -> list[str]:
     return en_words + cjk_chars + cjk_bigrams
 
 
+tokenize = tokenize_bm25
+tokenize_for_fts = tokenize_bm25
+
+
 def build_bm25_tokens(
     text: str,
     *,
@@ -606,7 +623,7 @@ def extract_keywords_from_target(target: str) -> list[str]:
     cleaned = _TRAILING_FORGET_NOISE_RE.sub("", target).strip()
     keywords: list[str] = []
     for token in re.findall(r"[A-Za-z0-9_-]{2,}", cleaned):
-        if token.casefold() not in _EN_STOPWORDS and token not in keywords:
+        if token.casefold() not in _FORGET_STOPWORDS and token not in keywords:
             keywords.append(token)
     for cjk_chunk in re.findall(r"[\u3400-\u9fff]+", cleaned):
         for seg in re.split(r"[的在是把了和与及]+", cjk_chunk):
@@ -616,6 +633,54 @@ def extract_keywords_from_target(target: str) -> list[str]:
     if not keywords and len(cleaned) >= 2:
         keywords.append(cleaned)
     return keywords
+
+
+_USER_SELF_EMAIL_INTRO_RE = re.compile(
+    r"\bemail\s+(?:that\s+)?(?:(?:I\s+)?(?:just\s+)?(?:got|received)\s+)?from\b",
+    re.IGNORECASE,
+)
+_USER_SELF_GREETING_RE = re.compile(r"\b(?:Dear|Hi|Hello)\s+([A-Z][a-z]{2,20})\s*,")
+_USER_SELF_HI_TEAM_RE = re.compile(r"\b(?:Hi|Hello)\s+team\b", re.IGNORECASE)
+_USER_SELF_FIRST_PERSON_RE = re.compile(r"\b(?:I|my|mine|we|our|ours)\b", re.IGNORECASE)
+_USER_SELF_SIGNOFF_RE = re.compile(
+    r"(?:Best|Warm\s+regards|Regards|Sincerely)\s*,\s*\n+\s*([A-Z][a-z]{2,20})",
+    re.IGNORECASE,
+)
+_GENERIC_NAME_EXCLUSIONS = frozenset({
+    "team", "all", "everyone", "there", "folks", "colleagues", "friends",
+    "user", "users", "assistant", "system", "somebody", "anybody", "nobody", "everybody",
+})
+
+
+def infer_user_self_names(messages: Sequence[Any]) -> set[str]:
+    names: set[str] = set()
+    for m in messages:
+        if isinstance(m, dict):
+            role = str(m.get("role") or m.get("speaker") or "").casefold()
+            content = str(m.get("content") or "")
+        else:
+            role = str(getattr(m, "role", None) or getattr(m, "speaker", None) or "").casefold()
+            content = str(getattr(m, "content", None) or "")
+        if not content:
+            continue
+
+        # Pattern A: User introduces an email from someone else, greeting User by name
+        if role in ("user", "") and _USER_SELF_EMAIL_INTRO_RE.search(content):
+            for match in _USER_SELF_GREETING_RE.finditer(content):
+                name = match.group(1).strip()
+                if name.casefold() not in _GENERIC_NAME_EXCLUSIONS:
+                    names.add(name)
+
+        # Pattern B: 1st-person message addressing the team, signed by User
+        if _USER_SELF_HI_TEAM_RE.search(content) and (
+            _USER_SELF_FIRST_PERSON_RE.search(content) or "我" in content
+        ):
+            for match in _USER_SELF_SIGNOFF_RE.finditer(content):
+                name = match.group(1).strip()
+                if name.casefold() not in _GENERIC_NAME_EXCLUSIONS:
+                    names.add(name)
+
+    return names
 
 
 def regex_extract_batch(messages: Sequence[dict[str, Any]]) -> dict[str, Any]:

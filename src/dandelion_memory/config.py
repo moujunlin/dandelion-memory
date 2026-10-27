@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-v4"
     embedding_dimensions: int = 1024
     embedding_batch_size: int = Field(default=10, ge=1, le=10)
-    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    llm_model: str = "qwen3.5-flash"
+    llm_base_url: str = "https://aihubmix.com/v1"
+    llm_model: str = "gpt-4o-mini"
     llm_timeout: float = 35.0
     add_extract_budget: float = 35.0
     add_total_budget: float = 75.0

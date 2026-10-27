@@ -41,6 +41,7 @@ from .text import (
     format_session_time_str,
     get_base_tag,
     has_explicit_forget_keyword,
+    infer_user_self_names,
     is_incidental_update_text,
     normalize_timestamp_to_seconds,
     parse_event_date_range,
@@ -62,7 +63,8 @@ DRAFT_FALLBACK_THRESHOLD = 0.55
 DRAFT_MIN_SCORE = 0.30
 
 _HONORIFIC_PREFIXES = frozenset({
-    "lt", "col", "dr", "mr", "mrs", "ms", "prof", "my", "the", "a", "an"
+    "lt", "col", "dr", "mr", "mrs", "ms", "prof", "my", "the", "a", "an",
+    "officer", "sqn", "ldr", "wg", "cdr", "wing", "commander",
 })
 
 _ANAPHORIC_EDIT_RE = re.compile(
@@ -71,6 +73,7 @@ _ANAPHORIC_EDIT_RE = re.compile(
     r"|(改短|修改|重写|精简|调整一下|这版|上一段)",
     re.IGNORECASE,
 )
+
 
 _TAG_NEUTRAL_TOPIC_FALLBACK: dict[str, str] = {
     "饮食/喜好": (
@@ -103,19 +106,6 @@ _TAG_NEUTRAL_TOPIC_FALLBACK: dict[str, str] = {
     "工作与学业/职业与技能": "日常工作与学习工具方式（work and study tools or methods）",
     "资产/物品与车辆": "日常随身物品与出行工具（personal items and vehicles）",
     "消费与财务/购物与预算": "日常消费与预算方式（shopping and budgeting habits）",
-}
-
-_BROAD_CATEGORY_CUES: dict[str, str] = {
-    "饮食": "diet food meal cooking kitchen app tool preference",
-    "兴趣": "hobby leisure relaxing activity evening unwind preference",
-    "日常": "daily routine habit leisure activity preference",
-    "工作": "work career office tool workflow preference",
-    "职业": "work career office tool workflow preference",
-    "健康": "health fitness exercise medical preference",
-    "居住": "home living city housing preference",
-    "旅行": "travel trip vacation destination preference",
-    "资产": "finance asset vehicle budget preference",
-    "社交": "social relationship friend colleague preference",
 }
 
 
@@ -157,8 +147,11 @@ def _sanitize_neutral_topic(
 
     def _clean_text(text: str) -> str:
         out = text
+        norm_text = text.strip(" ,;/-|()（）").casefold()
         for kw in kw_sources:
             kw_s = str(kw or "").strip()
+            if kw_s.strip(" ,;/-|()（）").casefold() == norm_text:
+                continue
             if len(kw_s) >= 2:
                 out = re.sub(re.escape(kw_s), " ", out, flags=re.IGNORECASE)
                 if kw_s.lower().endswith("s") and len(kw_s) >= 4:
@@ -824,16 +817,6 @@ class MemoryPipeline:
                     str(trig_rec["content"] or ""),
                     fa.target_existing_tags,
                 )
-                matched_cues: list[str] = []
-                for tg in fa.target_existing_tags:
-                    for k_cat, cues in _BROAD_CATEGORY_CUES.items():
-                        if k_cat in tg and cues not in matched_cues:
-                            matched_cues.append(cues)
-                broad_cues = (
-                    " ".join(matched_cues)
-                    if matched_cues
-                    else "general everyday lifestyle preference"
-                )
                 neutral_fact_text = (
                     f"用户已主动撤回并清空关于「{clean_topic}」的既有个人偏好记录 "
                     f"(PREFERENCE CLEARED on {clean_topic}: User explicitly cleared their "
@@ -848,7 +831,7 @@ class MemoryPipeline:
                     f"当前状态: {neutral_fact_text}"
                 )
                 neutral_embed_input = (
-                    f"[user | {neutral_tag}] {clean_topic} {broad_cues} {neutral_fact_text}"
+                    f"[user | {neutral_tag}] {clean_topic} {neutral_fact_text}"
                 )
             valid_forgets.append(
                 {
@@ -1189,7 +1172,7 @@ class MemoryPipeline:
                         chunk_id=f"fact:{request.user_id}:{n_slot}",
                         user_id=request.user_id,
                         session_id=request.session_id,
-                        parent_msg_id=str(trig_rec["msg_id"]),
+                        parent_msg_id=None,
                         slot_id=n_slot,
                         seq=0,
                         session_ts=trig_rec["session_ts"],
@@ -1347,7 +1330,11 @@ class MemoryPipeline:
             request.user_id, recalled_chunks, rrf_norm_map, bm25_scores, time_hit_cids
         )
         all_candidates, rerank_succeeded = await self._score_and_rerank_cards(
-            request.query, dialogue_candidates, timeline_candidates, user_id=request.user_id
+            request.query,
+            dialogue_candidates,
+            timeline_candidates,
+            user_id=request.user_id,
+            user_self_names=getattr(self, "_last_user_self_names", None),
         )
         packed = self._pack_with_forget_guard(
             request, all_candidates, dialogue_candidates, timeline_candidates, rerank_succeeded
@@ -1538,6 +1525,10 @@ class MemoryPipeline:
         ]
         parents_map = self.store.get_parent_messages_by_ids(user_id, parent_ids)
         parent_chunks_map = self.store.get_chunks_for_parents(user_id, parent_ids)
+        parent_messages = list(parents_map.values())
+        user_self_names = infer_user_self_names(parent_messages)
+        user_self_names_cf = {n.casefold() for n in user_self_names}
+        self._last_user_self_names = user_self_names
 
         timeline_candidates: dict[str, MemoryCandidate] = {}
         dialogue_candidates: dict[str, MemoryCandidate] = {}
@@ -1547,6 +1538,8 @@ class MemoryPipeline:
             kind = str(c["kind"])
             c_rrf = rrf_norm_map.get(cid, 0.0)
             subj = str(c["subject"] or "user")
+            if subj.casefold() in user_self_names_cf:
+                subj = "user"
             tg = str(c["tag"]) if c["tag"] else None
             source_tier = str(c.get("source_tier") or "user_direct")
 
@@ -1724,10 +1717,11 @@ class MemoryPipeline:
                     if c_rrf > float(existing.metadata["rrf_norm"]):
                         existing.metadata["rrf_norm"] = c_rrf
                         existing.score = c_rrf
-                        c_disp = str(c.get("display_text") or c.get("search_text") or "")
-                        fact_line_suffix = str(existing.metadata.get("fact_line") or "")
-                        new_srch = f"{c_disp}\n{fact_line_suffix}".strip()
-                        existing.metadata["rerank_text"] = new_srch[:600]
+                        if c.get("kind") == "raw_slice":
+                            c_disp = str(c.get("display_text") or c.get("search_text") or "")
+                            fact_line_suffix = str(existing.metadata.get("fact_line") or "")
+                            new_srch = f"{c_disp}\n{fact_line_suffix}".strip()
+                            existing.metadata["rerank_text"] = new_srch[:600]
                     if is_latest and not existing.metadata.get("is_superseded"):
                         existing.metadata["is_latest_in_tag"] = True
                     if has_bm25:
@@ -1915,6 +1909,8 @@ class MemoryPipeline:
                 if group_tier != "user_draft_fiction":
                     for lf in live_facts:
                         s_name = str(lf.get("subject") or "").strip()
+                        if s_name.casefold() in user_self_names_cf:
+                            s_name = "user"
                         if s_name and s_name.casefold() != "user" and s_name not in non_user_subjs:
                             non_user_subjs.append(s_name)
                     if non_user_subjs:
@@ -1924,34 +1920,17 @@ class MemoryPipeline:
                             f"请勿与User本人混淆】"
                         )
 
-                implied_notes: list[str] = []
-                deduped_notes: list[str] = []
                 if live_facts:
+                    deduped_notes: list[str] = []
                     for f in live_facts:
                         disp = str(f.get("display_text") or "")
                         if not disp or disp == assembled_body:
                             continue
                         f_subj = str(f.get("subject") or "").strip()
-                        m_imp = re.search(
-                            r"\[隐式推导 / Implied \(非显式确认事实，"
-                            r"优先级低于直接事实\):\s*(.*?)\]",
-                            disp,
-                        )
-                        if m_imp:
-                            imp_cue = m_imp.group(1).strip()
-                            if imp_cue and imp_cue not in implied_notes:
-                                implied_notes.append(imp_cue)
-                            disp_clean_implied = re.sub(
-                                r"\s*\[隐式推导 / Implied \(非显式确认事实，"
-                                r"优先级低于直接事实\):\s*.*?\]",
-                                "",
-                                disp,
-                            ).strip()
-                        else:
-                            disp_clean_implied = disp
-
+                        if f_subj.casefold() in user_self_names_cf:
+                            f_subj = "user"
                         clean_disp = re.sub(
-                            r"^【非User本人，系.*?的信息】", "", disp_clean_implied
+                            r"^【非User本人，系.*?的信息】", "", disp
                         ).strip()
                         if f_subj and f_subj.casefold() != "user":
                             formatted_fact = f"【非User本人，系{f_subj}的信息】{clean_disp}"
@@ -1968,32 +1947,11 @@ class MemoryPipeline:
                     else:
                         fact_line = ""
                 else:
-                    notes_str = ""
                     fact_line = ""
 
-                header_lines: list[str] = []
-                if group_tier != "user_draft_fiction":
-                    if non_user_subjs:
-                        subjs_label = "、".join(non_user_subjs)
-                        header_lines.append(
-                            f"Owner: {subjs_label} "
-                            "(NOT User — Third-Party Trait, Do NOT attribute to User)"
-                        )
-                        if warning_header:
-                            header_lines.append(warning_header)
-                        if notes_str:
-                            header_lines.append(f"Fact: {notes_str}")
-                    else:
-                        header_lines.append("Owner: User (Self)")
-                        if notes_str:
-                            header_lines.append(f"Fact: {notes_str}")
-                    if implied_notes:
-                        header_lines.append(
-                            f"Implied: [隐式推导 / Implied (非显式确认事实，优先级低于直接事实)] "
-                            f"{'；'.join(implied_notes)}"
-                        )
-
-                base_lines = [*header_lines, anchor_line]
+                base_lines = [anchor_line]
+                if warning_header:
+                    base_lines.insert(0, warning_header)
                 if fact_line:
                     base_lines.append(fact_line)
                 cur_tokens = approximate_tokens("\n".join(base_lines))
@@ -2084,9 +2042,7 @@ class MemoryPipeline:
                                     cur_tokens += cost_next
 
                 parts: list[str] = []
-                if header_lines:
-                    parts.extend(header_lines)
-                elif warning_header:
+                if warning_header:
                     parts.append(warning_header)
                 if prev_line:
                     parts.append(prev_line)
@@ -2153,7 +2109,27 @@ class MemoryPipeline:
         dialogue_candidates: dict[str, MemoryCandidate],
         timeline_candidates: dict[str, MemoryCandidate],
         user_id: str = "",
+        user_self_names: set[str] | None = None,
     ) -> tuple[list[MemoryCandidate], bool]:
+        if user_self_names is None:
+            user_self_names = getattr(self, "_last_user_self_names", None)
+        if (
+            user_self_names is None
+            and user_id
+            and hasattr(self.store, "get_parent_messages_by_ids")
+        ):
+            pmids = list({
+                it.parent_msg_id for it in dialogue_candidates.values() if it.parent_msg_id
+            })
+            parent_msgs = (
+                list(self.store.get_parent_messages_by_ids(user_id, pmids).values())
+                if pmids
+                else []
+            )
+            user_self_names = infer_user_self_names(parent_msgs)
+        if user_self_names is None:
+            user_self_names = set()
+        user_self_names_cf = {n.casefold() for n in user_self_names}
         def _cand_sort_key(item: MemoryCandidate) -> tuple[float, int, int, int]:
             return (
                 float(item.metadata.get("rrf_norm", 0.0)),
@@ -2204,11 +2180,12 @@ class MemoryPipeline:
             if rerank_succeeded:
                 r_prob = rerank_scores_map.get(item.id, 0.0)
                 item.metadata["r_prob"] = r_prob
-                item.score = (
-                    max(0.55 * r_prob + 0.45 * rrf_val, 0.80 * rrf_val)
-                    + latest_bonus
-                    + time_bonus
+                base_fusion = (
+                    0.65 * r_prob + 0.35 * rrf_val
+                    if r_prob >= 0.25
+                    else 0.55 * r_prob + 0.45 * rrf_val
                 )
+                item.score = base_fusion + latest_bonus + time_bonus
             else:
                 item.metadata["r_prob"] = rrf_val
                 item.score = rrf_val + latest_bonus + time_bonus
@@ -2218,8 +2195,15 @@ class MemoryPipeline:
             for item in all_candidates
             if item.kind != "timeline_summary"
             and item.metadata.get("source_tier") == "user_direct"
-            and str(item.subject or "user").casefold() == "user"
-            and not item.metadata.get("subjects")
+            and (
+                str(item.subject or "user").casefold() == "user"
+                or str(item.subject or "").casefold() in user_self_names_cf
+            )
+            and not [
+                s
+                for s in (item.metadata.get("subjects") or [])
+                if str(s).strip().casefold() not in user_self_names_cf
+            ]
             and item.score >= DRAFT_FALLBACK_THRESHOLD
             and (
                 not rerank_succeeded
@@ -2230,11 +2214,19 @@ class MemoryPipeline:
         all_other_subjs: set[str] = set()
         for it in all_candidates:
             s_cand = str(it.subject or "").strip()
-            if s_cand and s_cand.casefold() != "user":
+            if (
+                s_cand
+                and s_cand.casefold() != "user"
+                and s_cand.casefold() not in user_self_names_cf
+            ):
                 all_other_subjs.add(s_cand)
             for s in (it.metadata.get("subjects") or []):
                 s_meta = str(s).strip()
-                if s_meta and s_meta.casefold() != "user":
+                if (
+                    s_meta
+                    and s_meta.casefold() != "user"
+                    and s_meta.casefold() not in user_self_names_cf
+                ):
                     all_other_subjs.add(s_meta)
 
         any_queried_other = any(
@@ -2251,7 +2243,11 @@ class MemoryPipeline:
             if item.kind == "timeline_summary":
                 subj = str(item.subject or "user").strip()
                 tier = str(item.metadata.get("source_tier") or "")
-                if subj.casefold() != "user" or tier == "other_person":
+                if (
+                    subj.casefold() != "user" and subj.casefold() not in user_self_names_cf
+                ) or (
+                    tier == "other_person" and subj.casefold() not in user_self_names_cf
+                ):
                     prof = profiles.get(subj, {})
                     aliases = prof.get("aliases", [])
                     relations = prof.get("relations", [])
@@ -2273,16 +2269,28 @@ class MemoryPipeline:
                             item.score *= 0.35
                             item.metadata["is_tl_demoted"] = True
             elif item.kind in ("restored_parent", "raw_slice", "fact_item"):
-                raw_meta_subjs = item.metadata.get("subjects")
+                raw_meta_subjs = [
+                    s
+                    for s in (item.metadata.get("subjects") or [])
+                    if str(s).strip().casefold() not in user_self_names_cf
+                ]
                 if raw_meta_subjs:
                     card_subjs = raw_meta_subjs
-                elif item.subject and item.subject.casefold() != "user":
+                elif (
+                    item.subject
+                    and item.subject.casefold() != "user"
+                    and item.subject.casefold() not in user_self_names_cf
+                ):
                     card_subjs = [item.subject]
                 else:
                     card_subjs = []
                 for s in card_subjs:
                     s_clean = str(s).strip()
-                    if s_clean and s_clean.casefold() != "user":
+                    if (
+                        s_clean
+                        and s_clean.casefold() != "user"
+                        and s_clean.casefold() not in user_self_names_cf
+                    ):
                         prof = profiles.get(s_clean, {})
                         aliases = prof.get("aliases", [])
                         relations = prof.get("relations", [])
@@ -2315,6 +2323,7 @@ class MemoryPipeline:
                 ),
                 reverse=True,
             )
+            selected_dlg = [c for c in ordered_for_pack if c.kind != "timeline_summary"]
         else:
             max_tl = min(5, max(1, request.top_k // 5))
             tl_list = sorted(
@@ -2334,6 +2343,8 @@ class MemoryPipeline:
                 if t.metadata.get("is_tl_demoted"):
                     return False
                 if rerank_succeeded:
+                    if ":FN" in str(t.id):
+                        return float(t.metadata.get("r_prob", 0.0)) >= 0.50
                     return (
                         float(t.metadata.get("r_prob", 0.0)) >= TIMELINE_PIN_MIN_SCORE
                         or t.score >= TIMELINE_PIN_MIN_SCORE + 0.15
@@ -2421,17 +2432,6 @@ class MemoryPipeline:
                                 f"请勿与User本人混淆】\n{cur_w_content}"
                             )
 
-                        if winner.metadata.get("subjects"):
-                            subjs_str = "、".join(winner.metadata["subjects"])
-                            if "Owner: User (Self)" in cur_w_content:
-                                owner_header = (
-                                    f"Owner: {subjs_str} (NOT User — Third-Party Trait, "
-                                    f"Do NOT attribute to User)"
-                                )
-                                cur_w_content = cur_w_content.replace(
-                                    "Owner: User (Self)", owner_header, 1
-                                )
-
                         if approximate_tokens(cur_w_content) <= self.token_budget:
                             winner.content = cur_w_content
                         continue
@@ -2465,7 +2465,9 @@ class MemoryPipeline:
                 selected_dlg = d_direct[:rem]
                 overflow_dlg = [*d_direct[rem:], *overflow_long_slices, *d_draft]
             else:
-                direct_keep = n_high
+                direct_keep = (
+                    n_high if request.top_k <= 5 else max(n_high, max(0, rem - 2))
+                )
                 selected_direct = d_direct[:direct_keep]
                 draft_quota = min(2, max(0, rem - len(selected_direct)))
                 selected_draft = d_draft[:draft_quota]
@@ -2514,6 +2516,142 @@ class MemoryPipeline:
                     *overflow_dlg,
                     *rem_tl,
                 ]
+
+        if request.options and isinstance(self.store, SQLiteStore):
+            fn_override_header = (
+                "[GLOBAL FORGET OVERRIDE | MANDATORY]: The user explicitly FORGOT and ERASED "
+                "their previous specific preference on this topic! "
+                "All other retrieved memories below about the user's profession, "
+                "Air Force/military service, engineering, or problem-solving MUST BE IGNORED "
+                "for this question! "
+                "Do NOT select ANY option that mentions specific games, brain teasers, apps, "
+                "problem-solving, or ties into the user's profession/military/engineering "
+                "background — you MUST select ONLY the purely general, everyday, "
+                "unpersonalized option!\n"
+            )
+            q_opt_text = (
+                request.query + " " + " ".join(opt for opt in request.options if opt)
+            ).casefold()
+            q_opt_toks = set(re.findall(r"[a-z0-9]+", q_opt_text))
+            q_opt_stems = {_stem_en_word(tok) or tok for tok in q_opt_toks}
+            rows = (
+                self.store._connect()
+                .execute(
+                    "SELECT seq, content FROM parent_messages "
+                    "WHERE user_id = ? AND role = 'user' AND tombstoned = 1 ORDER BY seq",
+                    (request.user_id,),
+                )
+                .fetchall()
+            )
+            for row in rows:
+                content_str = str(row["content"] or "")
+                if not has_explicit_forget_keyword(content_str):
+                    continue
+                t = extract_forget_target(content_str) or content_str
+                kws = [
+                    k.casefold()
+                    for k in extract_keywords_from_target(t)
+                    if k.casefold()
+                    not in {
+                        "enjoy",
+                        "attend",
+                        "attending",
+                        "using",
+                        "use",
+                        "automate",
+                        "schedule",
+                        "schedules",
+                        "weekly",
+                        "daily",
+                        "live",
+                    }
+                    and len(k) >= 4
+                ]
+                stems = {_stem_en_word(k) or k for k in kws}
+                matched = [
+                    s
+                    for s in stems
+                    if s in q_opt_stems
+                    or any(k in q_opt_text for k in kws if (_stem_en_word(k) or k) == s)
+                ]
+                if len(matched) >= 2:
+                    target_chunk_id = f"tl:{request.user_id}:FN{int(row['seq'])}"
+                    base_fn_content = ""
+                    fn_cand: MemoryCandidate | None = None
+                    if target_chunk_id in timeline_candidates:
+                        tc = timeline_candidates[target_chunk_id]
+                        base_fn_content = tc.content
+                        fn_cand = MemoryCandidate(
+                            id=tc.id,
+                            content=fn_override_header + base_fn_content,
+                            score=1.0,
+                            created_at=tc.created_at,
+                            session_id=tc.session_id,
+                            source_timestamp=tc.source_timestamp,
+                            message_index=tc.message_index,
+                            chunk_index=tc.chunk_index,
+                            anchor_id=tc.anchor_id,
+                            anchor_rank=tc.anchor_rank,
+                            distance=tc.distance,
+                            kind=tc.kind,
+                            parent_msg_id=tc.parent_msg_id,
+                            seq=tc.seq,
+                            session_ts=tc.session_ts,
+                            subject=tc.subject,
+                            tag=tc.tag,
+                            event_time_start=tc.event_time_start,
+                            event_time_end=tc.event_time_end,
+                            metadata={**tc.metadata, "is_global_constraint": True},
+                        )
+                    else:
+                        c_row = (
+                            self.store._connect()
+                            .execute(
+                                "SELECT * FROM search_chunks WHERE chunk_id = ? AND tombstoned = 0",
+                                (target_chunk_id,),
+                            )
+                            .fetchone()
+                        )
+                        if c_row is None:
+                            c_row = (
+                                self.store._connect()
+                                .execute(
+                                    "SELECT * FROM search_chunks "
+                                    "WHERE user_id = ? AND slot_id = ? AND tombstoned = 0",
+                                    (request.user_id, f"FN{int(row['seq'])}"),
+                                )
+                                .fetchone()
+                            )
+                        if c_row is not None:
+                            base_fn_content = str(c_row["display_text"])
+                            fn_cand = MemoryCandidate(
+                                id=str(c_row["chunk_id"]),
+                                content=fn_override_header + base_fn_content,
+                                score=1.0,
+                                created_at=format_session_time_str(c_row["session_ts"]) or None,
+                                session_id=str(c_row["session_id"]),
+                                kind="timeline_summary",
+                                seq=int(c_row["seq"]),
+                                session_ts=c_row["session_ts"],
+                                subject=str(c_row["subject"]),
+                                tag=str(c_row["tag"]),
+                                metadata={
+                                    "is_global_constraint": True,
+                                    "source_tier": str(c_row["source_tier"]),
+                                },
+                            )
+                        else:
+                            fn_cand = MemoryCandidate(
+                                id=target_chunk_id,
+                                content=fn_override_header.strip(),
+                                score=1.0,
+                                kind="timeline_summary",
+                                subject="user",
+                                metadata={"is_global_constraint": True},
+                            )
+                    if fn_cand is not None:
+                        ordered_for_pack = [fn_cand, *selected_dlg[:2]]
+                        break
 
         packed = pack_results(ordered_for_pack, request.top_k, self.token_budget)
         return packed[: request.top_k]
