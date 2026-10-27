@@ -60,7 +60,7 @@ DRAFT_FALLBACK_THRESHOLD = 0.55
 DRAFT_MIN_SCORE = 0.30
 
 _HONORIFIC_PREFIXES = frozenset({
-    "lt", "col", "dr", "mr", "mrs", "ms", "prof", "my", "the", "a", "an", "officer", "sqn", "ldr"
+    "lt", "col", "dr", "mr", "mrs", "ms", "prof", "my", "the", "a", "an"
 })
 
 _ANAPHORIC_EDIT_RE = re.compile(
@@ -70,103 +70,6 @@ _ANAPHORIC_EDIT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_COLLEAGUE_SIGNOFF_RE = re.compile(
-    r"(?:Warm\s+regards|Best\s+regards|Kind\s+regards|Regards|Sincerely|Cheers|Best|Warmly)"
-    r"\s*[,，]?\s*\n+\s*([A-Z][A-Za-z.\s]{1,28})",
-    re.MULTILINE,
-)
-
-_CASE_STUDY_OFFICER_RE = re.compile(
-    r"\b((?:Lieutenant|Squadron\s+Leader|Captain|Major|Colonel|"
-    r"Lt\.?\s*Col\.?|Lt\.?|Sqn\.?\s*Ldr\.?)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"
-)
-
-_STOP_REVOKE_TOKS = frozenset({
-    "prefer", "prefers", "preference", "preferences", "like", "likes",
-    "love", "loves", "enjoy", "enjoys", "using", "used", "want", "wants",
-    "user", "about", "that", "this", "with", "from", "have", "having",
-    "would", "could", "should", "their", "there", "which", "where", "when",
-})
-
-
-def _format_third_party_warning(subjs: Sequence[str]) -> str:
-    subjs_label = "、".join(subjs)
-    subjs_en = ", ".join(subjs)
-    return (
-        f"【注意：本段包含非User本人（系{subjs_label}）的信息，请勿与User本人混淆】"
-        f"[THIRD-PARTY ATTRIBUTION CONSTRAINT: The traits, background, or events in this snippet "
-        f"belong to {subjs_en} (a colleague's email or third-person case study), NOT the user! "
-        f"Do NOT select any option that relies on or attributes {subjs_en}'s traits to the user; "
-        f"choose a neutral or alternative valid preference instead.]"
-    )
-
-
-def _infer_user_self_names(store: SQLiteStore, user_id: str) -> set[str]:
-    conn = store._connect()
-    names: set[str] = set()
-    rows = conn.execute(
-        "SELECT display_text FROM search_chunks "
-        "WHERE user_id = ? AND kind = 'fact_item' AND subject = 'user' AND tombstoned = 0",
-        (user_id,),
-    ).fetchall()
-    for r in rows:
-        txt = str(r["display_text"] or "")
-        for m in re.finditer(
-            r"(?:User\s+is|referred\s+to\s+as|named|名叫|名为)\s+([A-Z][A-Za-z.\s]{2,30})",
-            txt,
-        ):
-            cand = m.group(1).strip()
-            for tok in re.findall(r"[A-Za-z]+", cand):
-                if len(tok) >= 3 and tok.casefold() not in _HONORIFIC_PREFIXES:
-                    names.add(tok.casefold())
-    u_rows = conn.execute(
-        "SELECT content FROM parent_messages "
-        "WHERE user_id = ? AND role = 'user' AND tombstoned = 0",
-        (user_id,),
-    ).fetchall()
-    for r in u_rows:
-        c = str(r["content"] or "")
-        for m in re.finditer(
-            r"(?:With\s+respects|Respectfully)\s*[,，]?\s*\n+\s*([A-Z][A-Za-z.\s]{2,28})",
-            c,
-        ):
-            for tok in re.findall(r"[A-Za-z]+", m.group(1)):
-                if len(tok) >= 3 and tok.casefold() not in _HONORIFIC_PREFIXES:
-                    names.add(tok.casefold())
-    return names
-
-
-def _detect_fallback_third_party_subjects(
-    p_content: str, role: str, self_name_toks: set[str]
-) -> list[str]:
-    found: list[str] = []
-    if role == "user":
-        for m in _COLLEAGUE_SIGNOFF_RE.finditer(p_content):
-            cand = m.group(1).strip().splitlines()[0].strip(" .,;:")
-            toks = [
-                t.casefold()
-                for t in re.findall(r"[A-Za-z]+", cand)
-                if len(t) >= 3 and t.casefold() not in _HONORIFIC_PREFIXES
-            ]
-            if toks and not (set(toks) & self_name_toks) and cand not in found:
-                found.append(cand)
-    p_low = p_content.casefold()
-    if (
-        "case study" in p_low
-        or "scenario" in p_low
-        or "lieutenant" in p_low
-        or "squadron leader" in p_low
-    ):
-        for m in _CASE_STUDY_OFFICER_RE.finditer(p_content):
-            cand = m.group(1).strip()
-            toks = [
-                t.casefold()
-                for t in re.findall(r"[A-Za-z]+", cand)
-                if len(t) >= 3 and t.casefold() not in _HONORIFIC_PREFIXES
-            ]
-            if toks and not (set(toks) & self_name_toks) and cand not in found:
-                found.append(cand)
-    return found[:2]
 
 def _is_subj_in_query(
     query: str,
@@ -1388,7 +1291,6 @@ class MemoryPipeline:
         ]
         parents_map = self.store.get_parent_messages_by_ids(user_id, parent_ids)
         parent_chunks_map = self.store.get_chunks_for_parents(user_id, parent_ids)
-        self_name_toks = _infer_user_self_names(self.store, user_id)
 
         timeline_candidates: dict[str, MemoryCandidate] = {}
         dialogue_candidates: dict[str, MemoryCandidate] = {}
@@ -1763,23 +1665,13 @@ class MemoryPipeline:
                     for lf in live_facts:
                         s_name = str(lf.get("subject") or "").strip()
                         if s_name and s_name.casefold() != "user" and s_name not in non_user_subjs:
-                            s_toks = {
-                                t.casefold()
-                                for t in re.findall(r"[A-Za-z]+", s_name)
-                                if len(t) >= 3 and t.casefold() not in _HONORIFIC_PREFIXES
-                            }
-                            if s_toks and (s_toks & self_name_toks):
-                                continue
                             non_user_subjs.append(s_name)
-                    if not non_user_subjs:
-                        fb_subjs = _detect_fallback_third_party_subjects(
-                            p_content, str(parent.get("role") or ""), self_name_toks
-                        )
-                        for s_name in fb_subjs:
-                            if s_name not in non_user_subjs:
-                                non_user_subjs.append(s_name)
                     if non_user_subjs:
-                        warning_header = _format_third_party_warning(non_user_subjs)
+                        subjs_label = "、".join(non_user_subjs)
+                        warning_header = (
+                            f"【注意：本段包含非User本人（系{subjs_label}）的信息，"
+                            f"请勿与User本人混淆】"
+                        )
 
                 if live_facts:
                     deduped_notes: list[str] = []
@@ -2179,8 +2071,11 @@ class MemoryPipeline:
                             winner.metadata.get("subjects")
                             and "【注意：本段包含非User本人" not in cur_w_content
                         ):
-                            w_hdr = _format_third_party_warning(winner.metadata["subjects"])
-                            cur_w_content = f"{w_hdr}\n{cur_w_content}"
+                            subjs_str = "、".join(winner.metadata["subjects"])
+                            cur_w_content = (
+                                f"【注意：本段包含非User本人（系{subjs_str}）的信息，"
+                                f"请勿与User本人混淆】\n{cur_w_content}"
+                            )
 
                         if approximate_tokens(cur_w_content) <= self.token_budget:
                             winner.content = cur_w_content
@@ -2265,41 +2160,6 @@ class MemoryPipeline:
                 ]
 
         packed = pack_results(ordered_for_pack, request.top_k, self.token_budget)
-        if packed and isinstance(self.store, SQLiteStore):
-            conn = self.store._connect()
-            tomb_rows = conn.execute(
-                "SELECT content FROM parent_messages "
-                "WHERE user_id = ? AND role = 'user' AND tombstoned = 1",
-                (request.user_id,),
-            ).fetchall()
-            revoked_topics: list[str] = []
-            for r in tomb_rows:
-                t_desc = extract_forget_target(str(r["content"] or ""))
-                if t_desc:
-                    for tok in re.findall(r"[A-Za-z]{4,}", t_desc):
-                        tl = tok.casefold()
-                        if tl not in _STOP_REVOKE_TOKS and tl not in revoked_topics:
-                            revoked_topics.append(tl)
-            if revoked_topics:
-                q_and_opts = (
-                    request.query + " " + " ".join(request.options or [])
-                ).casefold()
-                matched_revoked = [
-                    t
-                    for t in revoked_topics
-                    if re.search(r"\b" + re.escape(t) + r"\b", q_and_opts)
-                ]
-                if matched_revoked:
-                    topic_str = ", ".join(matched_revoked)
-                    revoked_header = (
-                        f"[REVOKED PREFERENCE CONSTRAINT: The user has explicitly "
-                        f"revoked/forgotten preferences matching ({topic_str}). "
-                        f"Do NOT select any option that relies on or references ({topic_str}), "
-                        f"even if combined with other valid user traits; choose a neutral "
-                        f"or alternative valid preference instead.]\n"
-                    )
-                    if not packed[0].content.startswith("[REVOKED PREFERENCE CONSTRAINT:"):
-                        packed[0].content = revoked_header + packed[0].content
         return packed[: request.top_k]
 
     async def _search_v1_compat(self, request: SearchRequest) -> SearchResponse:
