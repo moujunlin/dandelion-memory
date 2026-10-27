@@ -59,6 +59,47 @@ TIMELINE_PIN_MIN_SCORE = 0.40
 DRAFT_FALLBACK_THRESHOLD = 0.55
 DRAFT_MIN_SCORE = 0.30
 
+_HONORIFIC_PREFIXES = frozenset({
+    "lt", "col", "dr", "mr", "mrs", "ms", "prof", "my", "the", "a", "an", "officer", "sqn", "ldr"
+})
+
+def _is_subj_in_query(
+    query: str,
+    person_key: str,
+    aliases: Sequence[str] | None = None,
+    relations: Sequence[str] | None = None,
+) -> bool:
+    if not query or not person_key:
+        return False
+    q_low = query.strip().casefold()
+
+    candidates: set[str] = set()
+    raw_terms = [person_key, *(aliases or []), *(relations or [])]
+    for raw in raw_terms:
+        if not raw:
+            continue
+        cleaned = str(raw).strip()
+        if cleaned:
+            candidates.add(cleaned)
+        for tok in re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", cleaned):
+            tok_low = tok.casefold()
+            if len(tok) >= 3 and tok_low not in _HONORIFIC_PREFIXES:
+                candidates.add(tok)
+
+    for term in candidates:
+        t_clean = term.strip().strip(".")
+        if not t_clean:
+            continue
+        t_low = t_clean.casefold()
+        if any("\u4e00" <= ch <= "\u9fff" for ch in t_clean):
+            if t_low in q_low:
+                return True
+        else:
+            pattern = r"\b" + re.escape(t_low) + r"\b"
+            if re.search(pattern, q_low):
+                return True
+    return False
+
 
 def _literal_cold_tag_overlap(tag_a: str, tag_b: str) -> float:
     if not tag_a.startswith("其他/") or not tag_b.startswith("其他/"):
@@ -161,6 +202,112 @@ class MemoryPipeline:
         self.chunk_target_chars = chunk_target_chars
         self.chunk_max_chars = chunk_max_chars
         self._user_locks: dict[str, asyncio.Lock] = {}
+        self._turns_since_state_sync: dict[str, int] = {}
+        self._state_unsynced: dict[str, bool] = {}
+        self._turns_since_person_reconcile: dict[str, int] = {}
+        self._person_reconcile_unsynced: dict[str, bool] = {}
+        self._is_subj_in_query = _is_subj_in_query
+
+    async def _consolidate_user_state_bar(
+        self, user_id: str, session_id: str, *, deadline: float
+    ) -> None:
+        assert isinstance(self.store, SQLiteStore)
+        rem = deadline - time.monotonic()
+        if rem <= 0.3 or not hasattr(self.extractor, "summarize_state_slots"):
+            return
+        living_facts = self.store.get_living_facts(user_id)
+        self._turns_since_state_sync[user_id] = 0
+        self._state_unsynced[user_id] = False
+        if len(living_facts) < 2:
+            return
+
+        # BLOCKING-2: 按 subject 分组，仅对活跃槽位数 >= 2 的同一人物调用归并模型
+        by_subj: dict[str, list[dict[str, Any]]] = {}
+        for lf in living_facts:
+            s = str(lf.get("subject") or "user").strip()
+            by_subj.setdefault(s, []).append(lf)
+
+        for subj_facts in by_subj.values():
+            if len(subj_facts) < 2:
+                continue
+            cur_rem = deadline - time.monotonic()
+            if cur_rem <= 0.3:
+                break
+            try:
+                merges = await asyncio.wait_for(
+                    self.extractor.summarize_state_slots(subj_facts),
+                    timeout=cur_rem,
+                )
+                if merges:
+                    self.store.merge_timeline_slots(user_id, session_id, merges)
+            except Exception:
+                pass
+
+    async def _reconcile_person_map_task(
+        self, user_id: str, session_id: str, *, deadline: float
+    ) -> None:
+        assert isinstance(self.store, SQLiteStore)
+        rem = deadline - time.monotonic()
+        if rem <= 0.3 or not hasattr(self.extractor, "reconcile_person_map"):
+            return
+        self._turns_since_person_reconcile[user_id] = 0
+        self._person_reconcile_unsynced[user_id] = False
+
+        living_facts = self.store.get_living_facts(user_id)
+        profiles = self.store.get_person_profiles(user_id)
+
+        subj_to_slots: dict[str, list[dict[str, Any]]] = {}
+        for lf in living_facts:
+            s = str(lf.get("subject") or "user").strip()
+            subj_to_slots.setdefault(s, []).append({
+                "fid": lf.get("slot_id"),
+                "slot_id": lf.get("slot_id"),
+                "tag": lf.get("tag"),
+                "state": lf.get("current_state"),
+            })
+
+        all_persons = set(subj_to_slots.keys()) | set(profiles.keys())
+        if len(all_persons) <= 1 and not profiles:
+            return
+
+        snapshot: list[dict[str, Any]] = []
+        for p in sorted(all_persons):
+            prof = profiles.get(p, {})
+            snapshot.append({
+                "person": p,
+                "aliases": list(prof.get("aliases") or []),
+                "relations": list(prof.get("relations") or []),
+                "slots": subj_to_slots.get(p, []),
+            })
+
+        try:
+            res = await asyncio.wait_for(
+                self.extractor.reconcile_person_map(snapshot),
+                timeout=rem,
+            )
+            if res and (
+                res.get("merge_persons")
+                or res.get("move_slots")
+                or res.get("profile_updates")
+            ):
+                self.store.apply_person_map_updates(
+                    user_id,
+                    session_id,
+                    merge_persons=res.get("merge_persons"),
+                    move_slots=res.get("move_slots"),
+                    profile_updates=res.get("profile_updates"),
+                )
+                target_persons: set[str] = set()
+                for mp in (res.get("merge_persons") or []):
+                    if mp.get("to"):
+                        target_persons.add(str(mp["to"]))
+                for mv in (res.get("move_slots") or []):
+                    if mv.get("to"):
+                        target_persons.add(str(mv["to"]))
+                if target_persons and hasattr(self.extractor, "summarize_state_slots"):
+                    await self._consolidate_user_state_bar(user_id, session_id, deadline=deadline)
+        except Exception:
+            pass
 
     def _get_user_lock(self, user_id: str) -> asyncio.Lock:
         lock = self._user_locks.get(user_id)
@@ -363,13 +510,17 @@ class MemoryPipeline:
         active_batch = [r for r in batch_records if r["tombstoned"] == 0]
         facts: list[ExtractedFact] = []
         forget_actions: list[ExtractedForgetAction] = []
+        use_two_pass = hasattr(self.extractor, "summarize_state_slots")
+        pass1_living = None if use_two_pass else living_facts
+        pass1_tags = [] if use_two_pass else existing_tags
+
         if active_batch:
             if len(active_batch) <= 16:
                 try:
                     rem_ext = max(0.05, extract_deadline - time.monotonic())
                     raw_ext = await asyncio.wait_for(
                         self._invoke_extractor(
-                            active_batch, existing_tags, living_facts=living_facts
+                            active_batch, pass1_tags, living_facts=pass1_living
                         ),
                         timeout=rem_ext,
                     )
@@ -398,7 +549,7 @@ class MemoryPipeline:
                         try:
                             return await asyncio.wait_for(
                                 self._invoke_extractor(
-                                    win_msgs, existing_tags, living_facts=living_facts
+                                    win_msgs, pass1_tags, living_facts=pass1_living
                                 ),
                                 timeout=rem_ext,
                             )
@@ -417,6 +568,16 @@ class MemoryPipeline:
         # Stage 2 (No DB write lock): Pre-align facts & single batch embed immutable chunks
         seq_to_rec = {int(r["seq"]): r for r in batch_records}
         active_seq_set = {int(r["seq"]) for r in active_batch}
+
+        if hasattr(self.store, "_allocate_next_slot_id"):
+            curr_slot = self.store._allocate_next_slot_id(request.user_id)
+        else:
+            curr_slot = "F1"
+        slot_counter = (
+            int(curr_slot[1:])
+            if curr_slot.startswith("F") and curr_slot[1:].isdigit()
+            else 1
+        )
 
         prepared_facts: list[dict[str, Any]] = []
         for f_idx, fact in enumerate(facts):
@@ -443,13 +604,33 @@ class MemoryPipeline:
                 fact.event_date_end,
                 fallback_ts=primary_session_ts,
             )
-            fact_chunk_id = f"fact:{request.request_id}:{f_idx:04d}"
+            fact_slot_id: str | None = None
+            if fact.source_tier != "user_draft_fiction":
+                clean_target = str(fact.target_id or "").strip().strip("[]#")
+                if clean_target and clean_target.startswith("F") and clean_target[1:].isdigit():
+                    fact_slot_id = clean_target
+                    fact_chunk_id = f"fact:{request.user_id}:{fact_slot_id}"
+                elif getattr(fact, "is_v24", False):
+                    fact_slot_id = f"F{slot_counter}"
+                    slot_counter += 1
+                    fact_chunk_id = f"fact:{request.user_id}:{fact_slot_id}"
+                elif fact.prev_state or fact.op in ("set", "delete"):
+                    fact_slot_id = None
+                    fact_chunk_id = f"fact:{request.request_id}:{f_idx:04d}"
+                else:
+                    fact_slot_id = f"F{slot_counter}"
+                    slot_counter += 1
+                    fact_chunk_id = f"fact:{request.request_id}:{f_idx:04d}"
+            else:
+                fact_chunk_id = f"fact:{request.request_id}:{f_idx:04d}"
+
             fact_search_text = (
                 f"[{fact.subject} | {fact.tag}] {fact.tag} {fact.current_state} {formatted_note}"
             ).strip()
             prepared_facts.append(
                 {
                     "fact": fact,
+                    "slot_id": fact_slot_id,
                     "valid_seqs": valid_seqs,
                     "primary_seq": primary_seq,
                     "primary_msg_id": primary_msg_id,
@@ -626,27 +807,43 @@ class MemoryPipeline:
                     # Strict prohibition: user_draft_fiction never enters tag_timelines
                     is_fact_tombstoned = False
                     if fact.source_tier != "user_draft_fiction":
-                        rendered_summary, tl_seq, tl_ts, resolved_tag, is_fact_tombstoned = (
-                            self.store.upsert_tag_timeline(
-                                user_id=request.user_id,
-                                subject=fact.subject,
-                                tag=fact.tag,
-                                seq=pf["primary_seq"],
-                                session_ts=pf["primary_session_ts"],
-                                time_str=pf["primary_time_str"],
-                                prev_state=fact.prev_state,
-                                current_state=fact.current_state,
-                                update_reason=fact.update_reason,
-                                fact_text=fact.fact_text,
-                                op=fact.op,
-                                target_id=fact.target_id,
-                                fact_chunk_id=pf["chunk_id"],
-                                source_seqs=pf["valid_seqs"],
-                            )
+                        upsert_res = self.store.upsert_tag_timeline(
+                            user_id=request.user_id,
+                            subject=fact.subject,
+                            tag=fact.tag,
+                            seq=pf["primary_seq"],
+                            session_ts=pf["primary_session_ts"],
+                            time_str=pf["primary_time_str"],
+                            prev_state=fact.prev_state,
+                            current_state=fact.current_state,
+                            update_reason=fact.update_reason,
+                            fact_text=fact.fact_text,
+                            op=fact.op,
+                            target_id=fact.target_id,
+                            fact_chunk_id=pf["chunk_id"],
+                            source_seqs=pf["valid_seqs"],
+                            slot_id=pf.get("slot_id"),
                         )
+                        resolved_tag = upsert_res[3]
+                        is_fact_tombstoned = upsert_res[4]
+                        resolved_slot_id = getattr(upsert_res, "slot_id", pf.get("slot_id"))
                         _check_deadline()
                         fact.tag = resolved_tag
+                        if resolved_slot_id:
+                            pf["slot_id"] = resolved_slot_id
+                            dirty_timeline_keys.append(resolved_slot_id)
                         dirty_timeline_keys.append((fact.subject, fact.tag))
+
+                        if (
+                            fact.subject.casefold() != "user"
+                            and hasattr(self.store, "upsert_person_profile")
+                        ):
+                            self.store.upsert_person_profile(
+                                request.user_id,
+                                fact.subject,
+                                aliases=getattr(fact, "aliases", None),
+                                relations=getattr(fact, "relations", None),
+                            )
 
                     for s in pf["valid_seqs"]:
                         _check_deadline()
@@ -672,6 +869,7 @@ class MemoryPipeline:
                         user_id=request.user_id,
                         session_id=request.session_id,
                         parent_msg_id=pf["primary_msg_id"],
+                        slot_id=pf.get("slot_id") or "",
                         seq=pf["primary_seq"],
                         session_ts=pf["primary_session_ts"],
                         kind="fact_item",
@@ -745,6 +943,35 @@ class MemoryPipeline:
                 payload_hash=payload_hash,
             )
 
+        if use_two_pass and active_batch:
+            n_rounds = max(1, sum(1 for r in active_batch if r["role"] == "user"))
+            acc_rounds = self._turns_since_state_sync.get(request.user_id, 0) + n_rounds
+            self._turns_since_state_sync[request.user_id] = acc_rounds
+            acc_person_rounds = (
+                self._turns_since_person_reconcile.get(request.user_id, 0) + n_rounds
+            )
+            self._turns_since_person_reconcile[request.user_id] = acc_person_rounds
+            if dirty_timeline_keys:
+                self._state_unsynced[request.user_id] = True
+                self._person_reconcile_unsynced[request.user_id] = True
+
+            if (
+                acc_person_rounds >= 40
+                and self._person_reconcile_unsynced.get(request.user_id)
+            ):
+                await self._reconcile_person_map_task(
+                    request.user_id,
+                    request.session_id,
+                    deadline=total_deadline - 0.1,
+                )
+
+            if acc_rounds >= 20 and self._state_unsynced.get(request.user_id):
+                await self._consolidate_user_state_bar(
+                    request.user_id,
+                    request.session_id,
+                    deadline=total_deadline - 0.1,
+                )
+
         return AddResponse(
             request_id=request.request_id,
             user_id=request.user_id,
@@ -803,27 +1030,89 @@ class MemoryPipeline:
 
     async def _search_v2(self, request: SearchRequest) -> SearchResponse:
         assert isinstance(self.store, SQLiteStore)
+        needs_person_flush = (
+            self._person_reconcile_unsynced.get(request.user_id)
+            and hasattr(self.extractor, "reconcile_person_map")
+        )
+        needs_state_flush = (
+            self._state_unsynced.get(request.user_id)
+            and hasattr(self.extractor, "summarize_state_slots")
+        )
+        if needs_person_flush or needs_state_flush:
+            lock = self._get_user_lock(request.user_id)
+            async with lock:
+                if self._person_reconcile_unsynced.get(request.user_id) and hasattr(
+                    self.extractor, "reconcile_person_map"
+                ):
+                    await self._reconcile_person_map_task(
+                        request.user_id,
+                        "search-flush",
+                        deadline=time.monotonic() + 7.5,
+                    )
+                if self._state_unsynced.get(request.user_id) and hasattr(
+                    self.extractor, "summarize_state_slots"
+                ):
+                    await self._consolidate_user_state_bar(
+                        request.user_id,
+                        "search-flush",
+                        deadline=time.monotonic() + 7.5,
+                    )
         chunks = self.store.get_active_chunks(request.user_id)
         if not chunks:
             return SearchResponse(data=[])
 
-        # 1. Query embedding & Multiple-choice options 0.7 / 0.3 synthesis (F13, P1-3)
+        (
+            recalled_chunks,
+            rrf_norm_map,
+            bm25_scores,
+            time_hit_cids,
+        ) = await self._recall_raw_and_facts(request, chunks)
+        if not recalled_chunks:
+            return SearchResponse(data=[])
+
+        self._pull_timeline_evidence(
+            request.user_id, chunks, recalled_chunks, rrf_norm_map, time_hit_cids
+        )
+        dialogue_candidates, timeline_candidates = self._build_turn_pair_cards(
+            request.user_id, recalled_chunks, rrf_norm_map, bm25_scores, time_hit_cids
+        )
+        all_candidates, rerank_succeeded = await self._score_and_rerank_cards(
+            request.query, dialogue_candidates, timeline_candidates, user_id=request.user_id
+        )
+        packed = self._pack_with_forget_guard(
+            request, all_candidates, dialogue_candidates, timeline_candidates, rerank_succeeded
+        )
+        return SearchResponse(
+            data=[
+                SearchItem(
+                    id=candidate.id,
+                    content=candidate.content,
+                    score=candidate.score,
+                    created_at=candidate.created_at,
+                )
+                for candidate in packed
+            ]
+        )
+
+    async def _recall_raw_and_facts(
+        self, request: SearchRequest, chunks: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[str, float], dict[str, float], set[str]]:
+        assert isinstance(self.store, SQLiteStore)
         pure_query = request.query
-        if request.options:
-            opt_texts = [opt[:150] for opt in request.options if opt and opt.strip()]
-        else:
-            opt_texts = []
+        opt_texts = (
+            [opt[:150] for opt in request.options if opt and opt.strip()]
+            if request.options
+            else []
+        )
 
         if opt_texts:
             opt_concat = pure_query + "\n" + "\n".join(opt_texts)
             vec_q, vec_opt = await self.embedder.embed([pure_query, opt_concat])
             dim = min(len(vec_q), len(vec_opt))
-            combined_vec = [0.7 * vec_q[i] + 0.3 * vec_opt[i] for i in range(dim)]
-            query_vec = _l2_normalize(combined_vec)
+            query_vec = _l2_normalize([0.7 * vec_q[i] + 0.3 * vec_opt[i] for i in range(dim)])
         else:
             [query_vec] = await self.embedder.embed([pure_query])
 
-        # 2. BM25 query term weights (2.0 for query stem, 0.5 for options)
         term_weights: dict[str, float] = {}
         stem_tokens = tokenize_bm25(pure_query)
         if opt_texts:
@@ -838,12 +1127,9 @@ class MemoryPipeline:
             for t in stem_tokens:
                 term_weights[t] = 1.0
 
-        # 3. Three-channel retrieval + Weighted RRF (K=60)
-        dense_scores: dict[str, float] = {}
-        for c in chunks:
-            cid = str(c["chunk_id"])
-            dense_scores[cid] = cosine_similarity(query_vec, c["vector"])
-
+        dense_scores = {
+            str(c["chunk_id"]): cosine_similarity(query_vec, c["vector"]) for c in chunks
+        }
         dense_ranked = sorted(
             chunks,
             key=lambda c: (
@@ -894,7 +1180,6 @@ class MemoryPipeline:
                 reverse=True,
             )[:100]
 
-        # P0-1: Only include recalled chunks from the 3 channels + resident global constraints
         time_hit_cids = {str(c["chunk_id"]) for c in time_ranked}
         rrf_raw: dict[str, float] = {}
         for rank_idx, c in enumerate(dense_ranked, start=1):
@@ -917,14 +1202,23 @@ class MemoryPipeline:
                     rrf_raw[cid] = 1e-6
 
         if not rrf_raw:
-            return SearchResponse(data=[])
+            return [], {}, bm25_scores, time_hit_cids
 
         max_rrf = max(rrf_raw.values()) if rrf_raw else 1.0
         rrf_norm_map = {cid: val / max_rrf for cid, val in rrf_raw.items()}
         recalled_chunks = [c for c in chunks if str(c["chunk_id"]) in rrf_raw]
+        return recalled_chunks, rrf_norm_map, bm25_scores, time_hit_cids
 
-        # Index-to-Raw Pull (v2.3 INV-4 / T4): pull active raw dialogue for recalled timelines
-        timeline_pull_map = self.store.get_timeline_pull_map(request.user_id)
+    def _pull_timeline_evidence(
+        self,
+        user_id: str,
+        chunks: list[dict[str, Any]],
+        recalled_chunks: list[dict[str, Any]],
+        rrf_norm_map: dict[str, float],
+        time_hit_cids: set[str],
+    ) -> None:
+        assert isinstance(self.store, SQLiteStore)
+        timeline_pull_map = self.store.get_timeline_pull_map(user_id)
         recalled_cids = {str(c["chunk_id"]) for c in recalled_chunks}
         chunks_by_seq: dict[int, list[dict[str, Any]]] = {}
         for c in chunks:
@@ -955,20 +1249,28 @@ class MemoryPipeline:
                         recalled_chunks.append(raw_c)
                         recalled_cids.add(rc_id)
 
-        # 4. Module D: Homogeneous (parent_msg_id, source_tier) grouping & assembly (v2.2/v2.3)
-        latest_tag_map = self.store.get_latest_tag_map(request.user_id)
-        superseded_seqs_map = self.store.get_superseded_seqs_map(request.user_id)
+    def _build_turn_pair_cards(
+        self,
+        user_id: str,
+        recalled_chunks: list[dict[str, Any]],
+        rrf_norm_map: dict[str, float],
+        bm25_scores: dict[str, float],
+        time_hit_cids: set[str],
+    ) -> tuple[dict[str, MemoryCandidate], dict[str, MemoryCandidate]]:
+        assert isinstance(self.store, SQLiteStore)
+        latest_tag_map = self.store.get_latest_tag_map(user_id)
+        active_slot_latest_seqs = self.store.get_active_slot_latest_seqs(user_id)
+        superseded_map = self.store.get_superseded_seqs_map(user_id)
         parent_ids = [
             str(c["parent_msg_id"])
             for c in recalled_chunks
             if c["kind"] != "timeline_summary" and c["parent_msg_id"]
         ]
-        parents_map = self.store.get_parent_messages_by_ids(request.user_id, parent_ids)
-        parent_chunks_map = self.store.get_chunks_for_parents(request.user_id, parent_ids)
+        parents_map = self.store.get_parent_messages_by_ids(user_id, parent_ids)
+        parent_chunks_map = self.store.get_chunks_for_parents(user_id, parent_ids)
 
         timeline_candidates: dict[str, MemoryCandidate] = {}
         dialogue_candidates: dict[str, MemoryCandidate] = {}
-        long_doc_slice_counts: dict[str, int] = {}
 
         for c in recalled_chunks:
             cid = str(c["chunk_id"])
@@ -1009,7 +1311,9 @@ class MemoryPipeline:
             p_ts = int(parent["session_ts"]) if parent["session_ts"] is not None else None
 
             is_latest = False
-            if tg and (subj, tg) in latest_tag_map:
+            if (subj.strip().casefold(), p_seq) in active_slot_latest_seqs:
+                is_latest = True
+            elif tg and (subj, tg) in latest_tag_map:
                 l_ts, l_seq = latest_tag_map[(subj, tg)]
                 if p_seq == l_seq or (
                     p_ts is not None and l_ts is not None and (p_ts, p_seq) >= (l_ts, l_seq)
@@ -1023,8 +1327,6 @@ class MemoryPipeline:
             )
 
             if int(parent["tombstoned"]) == 1 or all_raw_tombstoned:
-                # If raw parent or all its raw_slices were tombstoned,
-                # never expose raw_slice or reconstruct msg:..., but allow surviving fact_item
                 if kind == "fact_item":
                     t_str = str(parent["session_time_str"] or "")
                     t_header = f" | {t_str}" if t_str else ""
@@ -1055,7 +1357,6 @@ class MemoryPipeline:
 
             p_content = str(parent["content"] or "")
 
-            # Long document (>3000 chars): return raw_slice without parent/neighbor expansion (F3)
             if len(p_content) > LONG_DOC_CHAR_THRESHOLD:
                 if kind != "raw_slice":
                     continue
@@ -1080,8 +1381,6 @@ class MemoryPipeline:
                 )
                 continue
 
-            # Normal message (<=3000 chars): group by homogeneous (pmid, source_tier, subject)
-            all_p_chunks = parent_chunks_map.get(pmid, [])
             has_ud_fact = any(
                 ch["kind"] == "fact_item"
                 and int(ch["tombstoned"]) == 0
@@ -1123,60 +1422,39 @@ class MemoryPipeline:
                     and not is_incid_mixed
                 ):
                     target_groups.append(("user_direct", "user"))
-                else:
-                    g_subj = subj if source_tier == "other_person" else "user"
-                    target_groups.append((source_tier, g_subj))
-            else:
-                if source_tier == "user_draft_fiction":
+                elif source_tier == "user_draft_fiction":
                     target_groups.append(("user_draft_fiction", "user"))
-                elif source_tier == "other_person":
-                    target_groups.append(("other_person", subj))
                 else:
-                    op_subjs = list(
-                        dict.fromkeys(
-                            str(ch.get("subject") or "user")
-                            for ch in all_p_chunks
-                            if ch["kind"] == "fact_item"
-                            and int(ch["tombstoned"]) == 0
-                            and ch["source_tier"] == "other_person"
-                        )
-                    )
-                    if is_incid_mixed:
-                        if is_incidental_update_text(str(c["display_text"] or "")):
-                            target_groups.append(("user_direct", "user"))
-                        else:
-                            target_groups.append(("user_draft_fiction", "user"))
+                    target_groups.append(("user_direct", "user"))
+            else:
+                if is_incid_mixed:
+                    if is_incidental_update_text(str(c["display_text"] or "")):
+                        target_groups.append(("user_direct", "user"))
                     else:
-                        if not has_ud_fact and op_subjs:
-                            for op_s in op_subjs:
-                                target_groups.append(("other_person", op_s))
-                        else:
-                            target_groups.append(("user_direct", "user"))
-                            for op_s in op_subjs:
-                                target_groups.append(("other_person", op_s))
-                        if has_draft_fact and not has_ud_fact_or_raw:
-                            target_groups.append(("user_draft_fiction", "user"))
+                        target_groups.append(("user_draft_fiction", "user"))
+                elif source_tier == "user_draft_fiction":
+                    target_groups.append(("user_draft_fiction", "user"))
+                else:
+                    target_groups.append(("user_direct", "user"))
+                    if has_draft_fact and not has_ud_fact_or_raw:
+                        target_groups.append(("user_draft_fiction", "user"))
 
             has_bm25 = cid in bm25_scores
             has_time = cid in time_hit_cids
 
             for group_tier, group_subj in target_groups:
-                if group_tier == "user_direct":
-                    group_id = pmid
-                elif group_tier == "user_draft_fiction":
-                    group_id = f"{pmid}:user_draft_fiction"
-                else:
-                    group_id = f"{pmid}:other_person:{group_subj}"
+                group_id = (
+                    pmid
+                    if group_tier == "user_direct"
+                    else f"{pmid}:user_draft_fiction"
+                )
 
                 existing = dialogue_candidates.get(group_id)
                 if existing is not None:
                     if c_rrf > float(existing.metadata["rrf_norm"]):
                         existing.metadata["rrf_norm"] = c_rrf
                         existing.score = c_rrf
-                    if is_latest and (
-                        group_tier != "other_person"
-                        or subj.casefold() == group_subj.casefold()
-                    ):
+                    if is_latest and not existing.metadata.get("is_superseded"):
                         existing.metadata["is_latest_in_tag"] = True
                     if has_bm25:
                         existing.metadata["bm25_hit"] = True
@@ -1186,44 +1464,124 @@ class MemoryPipeline:
                         existing.tag = tg
                     continue
 
-                # On-demand assembly from child raw_slices & live fact_items of group
                 raw_slices = [ch for ch in all_p_chunks if ch["kind"] == "raw_slice"]
-                live_facts = [
-                    ch
-                    for ch in all_p_chunks
-                    if ch["kind"] == "fact_item"
-                    and int(ch["tombstoned"]) == 0
-                    and (
-                        ch["source_tier"] == group_tier
-                        or (
-                            group_tier == "user_direct"
-                            and ch["source_tier"] == "user_draft_fiction"
-                            and has_ud_fact_or_raw
-                            and not is_incid_mixed
+                if group_tier == "user_draft_fiction":
+                    live_facts = [
+                        ch
+                        for ch in all_p_chunks
+                        if ch["kind"] == "fact_item"
+                        and int(ch["tombstoned"]) == 0
+                        and ch["source_tier"] == "user_draft_fiction"
+                    ]
+                else:
+                    live_facts = [
+                        ch
+                        for ch in all_p_chunks
+                        if ch["kind"] == "fact_item"
+                        and int(ch["tombstoned"]) == 0
+                        and (
+                            ch["source_tier"] != "user_draft_fiction"
+                            or (has_ud_fact_or_raw and not is_incid_mixed)
                         )
+                    ]
+
+                prev_nb: dict[str, Any] | None = None
+                next_nb: dict[str, Any] | None = None
+                if group_tier == "user_direct":
+                    prev_nb, next_nb = self.store.get_session_neighbors(
+                        user_id, str(parent["session_id"]), p_seq
                     )
-                    and (
-                        group_tier != "other_person"
-                        or str(ch.get("subject") or "").casefold() == group_subj.casefold()
-                    )
-                ]
-                group_is_latest = (
-                    is_latest
+                    # BLOCKING-3: assistant 锚点卡若内联了配对的 prev_nb (user)，吸收其事实
                     if (
-                        group_tier != "other_person"
-                        or subj.casefold() == group_subj.casefold()
-                    )
-                    else False
+                        parent.get("role") == "assistant"
+                        and parent.get("turn_pair_id")
+                        and prev_nb
+                        and int(prev_nb["tombstoned"]) == 0
+                        and prev_nb.get("role") == "user"
+                        and prev_nb.get("turn_pair_id") == parent.get("turn_pair_id")
+                    ):
+                        prev_pmid = str(
+                            prev_nb.get("msg_id") or prev_nb.get("parent_msg_id") or ""
+                        )
+                        if prev_pmid:
+                            prev_chunks = self.store.get_chunks_for_parents(
+                                user_id, [prev_pmid]
+                            ).get(prev_pmid, [])
+                            for ch in prev_chunks:
+                                if (
+                                    ch["kind"] == "fact_item"
+                                    and int(ch["tombstoned"]) == 0
+                                    and ch["source_tier"] != "user_draft_fiction"
+                                    and ch not in live_facts
+                                ):
+                                    live_facts.append(ch)
+                has_active_latest_slot = (
+                    (subj.strip().casefold(), p_seq) in active_slot_latest_seqs
+                    or (group_subj.strip().casefold(), p_seq) in active_slot_latest_seqs
                 )
-                if not group_is_latest and live_facts:
+                if not has_active_latest_slot and live_facts:
                     for lf in live_facts:
-                        lf_subj = str(lf.get("subject") or "user")
-                        lf_tg = str(lf.get("tag") or "")
-                        if lf_tg and (lf_subj, lf_tg) in latest_tag_map:
-                            l_ts, l_seq = latest_tag_map[(lf_subj, lf_tg)]
-                            if p_seq == l_seq:
-                                group_is_latest = True
-                                break
+                        lf_subj = str(lf.get("subject") or "user").strip().casefold()
+                        lf_seq = int(lf.get("seq")) if lf.get("seq") is not None else p_seq
+                        if (lf_subj, p_seq) in active_slot_latest_seqs or (
+                            lf_subj,
+                            lf_seq,
+                        ) in active_slot_latest_seqs:
+                            has_active_latest_slot = True
+                            break
+
+                if has_active_latest_slot:
+                    group_is_latest = True
+                else:
+                    group_is_latest = is_latest
+                    if not group_is_latest and live_facts:
+                        for lf in live_facts:
+                            lf_subj = str(lf.get("subject") or "user")
+                            lf_tg = str(lf.get("tag") or "")
+                            if lf_tg and (lf_subj, lf_tg) in latest_tag_map:
+                                l_ts, l_seq = latest_tag_map[(lf_subj, lf_tg)]
+                                if p_seq == l_seq:
+                                    group_is_latest = True
+                                    break
+
+                is_superseded_turn = False
+                superseded_hints: list[str] = []
+                card_is_superseded = False
+                if group_tier == "user_direct":
+                    check_keys = {
+                        (group_subj.strip().casefold(), p_seq),
+                        (subj.strip().casefold(), p_seq),
+                    }
+                    for lf in live_facts:
+                        lf_subj = str(lf.get("subject") or "user").strip().casefold()
+                        lf_seq = int(lf.get("seq")) if lf.get("seq") is not None else p_seq
+                        check_keys.add((lf_subj, p_seq))
+                        check_keys.add((lf_subj, lf_seq))
+
+                    hit_sup_entries: list[tuple[int, str, str]] = []
+                    for k in check_keys:
+                        if k in superseded_map:
+                            is_superseded_turn = True
+                            for entry in superseded_map[k]:
+                                if entry not in hit_sup_entries:
+                                    hit_sup_entries.append(entry)
+
+                    if hit_sup_entries:
+                        for l_seq, _disp_tag, curr_st in hit_sup_entries:
+                            hint = (
+                                f"[状态更新提示: 本段提及的旧状态已于后续 "
+                                f"#{l_seq} 更新为: {curr_st}]"
+                            )
+                            if hint not in superseded_hints:
+                                superseded_hints.append(hint)
+
+                    if is_superseded_turn:
+                        if not has_active_latest_slot:
+                            group_is_latest = False
+                            card_is_superseded = True
+                        else:
+                            group_is_latest = True
+                            card_is_superseded = False
 
                 has_both_ud_and_draft = is_incid_mixed
                 has_incidental_slice = len(raw_slices) > 1 and any(
@@ -1278,14 +1636,34 @@ class MemoryPipeline:
                     )
                 anchor_line = raw_anchor_line
 
-                if live_facts:
-                    deduped_notes = list(
-                        dict.fromkeys(
-                            str(f["display_text"])
-                            for f in live_facts
-                            if f.get("display_text") and str(f["display_text"]) != assembled_body
+                warning_header = ""
+                non_user_subjs: list[str] = []
+                if group_tier != "user_draft_fiction":
+                    for lf in live_facts:
+                        s_name = str(lf.get("subject") or "").strip()
+                        if s_name and s_name.casefold() != "user" and s_name not in non_user_subjs:
+                            non_user_subjs.append(s_name)
+                    if non_user_subjs:
+                        subjs_label = "、".join(non_user_subjs)
+                        warning_header = (
+                            f"【注意：本段包含非User本人（系{subjs_label}）的信息，"
+                            f"请勿与User本人混淆】"
                         )
-                    )
+
+                if live_facts:
+                    deduped_notes: list[str] = []
+                    for f in live_facts:
+                        disp = str(f.get("display_text") or "")
+                        if not disp or disp == assembled_body:
+                            continue
+                        f_subj = str(f.get("subject") or "").strip()
+                        clean_disp = re.sub(r"^【非User本人，系.*?的信息】", "", disp).strip()
+                        if f_subj and f_subj.casefold() != "user":
+                            formatted_fact = f"【非User本人，系{f_subj}的信息】{clean_disp}"
+                        else:
+                            formatted_fact = clean_disp
+                        if formatted_fact and formatted_fact not in deduped_notes:
+                            deduped_notes.append(formatted_fact)
                     notes_str = "；".join(deduped_notes)
                     if notes_str:
                         if group_tier == "user_draft_fiction":
@@ -1306,30 +1684,33 @@ class MemoryPipeline:
                 next_line = ""
                 prev_seq_val: int | None = None
                 next_seq_val: int | None = None
-                # Only inline session neighbors when group_tier == 'user_direct' (§5.4.3)
                 if group_tier == "user_direct":
-                    prev_nb, next_nb = self.store.get_session_neighbors(
-                        request.user_id, str(parent["session_id"]), p_seq
-                    )
                     if prev_nb and int(prev_nb["tombstoned"]) == 0:
                         prev_nb_seq = int(prev_nb["seq"])
-                        prev_text = str(prev_nb["content"] or "")
-                        if len(prev_text) <= NEIGHBOR_MAX_CHARS and not self.store.is_seq_draft_fiction(
-                            request.user_id, prev_nb_seq
-                        ):
-                            cand_prev = f"[#{prev_nb_seq} | {prev_nb['speaker']}] {prev_text}"
-                            cost_prev = approximate_tokens(cand_prev)
-                            if cur_tokens + cost_prev <= self.token_budget:
-                                prev_line = cand_prev
-                                prev_seq_val = prev_nb_seq
-                                cur_tokens += cost_prev
+                        is_cross_role_leak = (
+                            parent.get("role") == "user"
+                            and prev_nb.get("role") == "assistant"
+                        )
+                        if not is_cross_role_leak:
+                            prev_text = str(prev_nb["content"] or "")
+                            is_prev_fiction = self.store.is_seq_draft_fiction(
+                                user_id, prev_nb_seq
+                            )
+                            if len(prev_text) <= NEIGHBOR_MAX_CHARS and not is_prev_fiction:
+                                cand_prev = f"[#{prev_nb_seq} | {prev_nb['speaker']}] {prev_text}"
+                                cost_prev = approximate_tokens(cand_prev)
+                                if cur_tokens + cost_prev <= self.token_budget:
+                                    prev_line = cand_prev
+                                    prev_seq_val = prev_nb_seq
+                                    cur_tokens += cost_prev
 
                     if next_nb and int(next_nb["tombstoned"]) == 0:
                         next_nb_seq = int(next_nb["seq"])
                         next_text = str(next_nb["content"] or "")
-                        if len(next_text) <= NEIGHBOR_MAX_CHARS and not self.store.is_seq_draft_fiction(
-                            request.user_id, next_nb_seq
-                        ):
+                        is_next_fiction = self.store.is_seq_draft_fiction(
+                            user_id, next_nb_seq
+                        )
+                        if len(next_text) <= NEIGHBOR_MAX_CHARS and not is_next_fiction:
                             cand_next = f"[#{next_nb_seq} | {next_nb['speaker']}] {next_text}"
                             cost_next = approximate_tokens(cand_next)
                             if cur_tokens + cost_next <= self.token_budget:
@@ -1338,6 +1719,8 @@ class MemoryPipeline:
                                 cur_tokens += cost_next
 
                 parts: list[str] = []
+                if warning_header:
+                    parts.append(warning_header)
                 if prev_line:
                     parts.append(prev_line)
                 parts.append(anchor_line)
@@ -1345,11 +1728,17 @@ class MemoryPipeline:
                     parts.append(next_line)
                 if fact_line:
                     parts.append(fact_line)
+                for hint in superseded_hints:
+                    parts.append(hint)
 
                 restored_text = "\n".join(parts)
                 best_srch = str(c.get("search_text") or c["display_text"])
                 if fact_line and fact_line not in best_srch:
                     best_srch = f"{best_srch}\n{fact_line}"
+                for hint in superseded_hints:
+                    if hint not in best_srch:
+                        best_srch = f"{best_srch}\n{hint}"
+                tp_id = str(parent.get("turn_pair_id") or "") if group_tier == "user_direct" else ""
                 dialogue_candidates[group_id] = MemoryCandidate(
                     id=group_id,
                     content=restored_text,
@@ -1365,8 +1754,10 @@ class MemoryPipeline:
                     metadata={
                         "rrf_norm": c_rrf,
                         "is_latest_in_tag": group_is_latest,
+                        "is_superseded": card_is_superseded,
                         "is_global_constraint": False,
                         "source_tier": group_tier,
+                        "turn_pair_id": tp_id,
                         "bm25_hit": has_bm25,
                         "time_hit": has_time,
                         "fact_line": fact_line,
@@ -1376,22 +1767,34 @@ class MemoryPipeline:
                         "prev_seq": prev_seq_val,
                         "next_line": next_line,
                         "next_seq": next_seq_val,
+                        "subjects": list(non_user_subjs),
                         "rerank_text": best_srch[:600],
                     },
                 )
+        return dialogue_candidates, timeline_candidates
 
-        # 5. Rerank top 50 candidates with pure query stem (F12.2, F13, F16, P1-4)
-        all_candidates = [*dialogue_candidates.values(), *timeline_candidates.values()]
-        all_candidates.sort(
-            key=lambda item: (
+    async def _score_and_rerank_cards(
+        self,
+        pure_query: str,
+        dialogue_candidates: dict[str, MemoryCandidate],
+        timeline_candidates: dict[str, MemoryCandidate],
+        user_id: str = "",
+    ) -> tuple[list[MemoryCandidate], bool]:
+        def _cand_sort_key(item: MemoryCandidate) -> tuple[float, int, int, int]:
+            return (
                 float(item.metadata.get("rrf_norm", 0.0)),
                 1 if item.metadata.get("is_latest_in_tag") else 0,
                 int(item.session_ts or 0),
                 int(item.seq),
-            ),
-            reverse=True,
-        )
-        rerank_pool = all_candidates[:50]
+            )
+
+        all_candidates = [*dialogue_candidates.values(), *timeline_candidates.values()]
+        all_candidates.sort(key=_cand_sort_key, reverse=True)
+        sorted_tl = sorted(timeline_candidates.values(), key=_cand_sort_key, reverse=True)
+        sorted_dlg = sorted(dialogue_candidates.values(), key=_cand_sort_key, reverse=True)
+        tl_pool = sorted_tl[:15]
+        dlg_pool = sorted_dlg[: max(35, 50 - len(tl_pool))]
+        rerank_pool = [*tl_pool, *dlg_pool]
         rerank_scores_map: dict[str, float] = {}
         rerank_succeeded = False
 
@@ -1415,59 +1818,10 @@ class MemoryPipeline:
                 rerank_scores_map = {}
                 rerank_succeeded = False
 
-        # DESIGN.md:152 & 154 scoring formulas + v2.3 T1 superseded & T6 third-person gating
-        pure_query_lower = pure_query.casefold()
-        history_compare_kws = (
-            "before",
-            "previously",
-            "used to",
-            "previous",
-            "former",
-            "originally",
-            "change",
-            "changed",
-            "difference",
-            "以前",
-            "之前",
-            "原来",
-            "原本",
-            "变化",
-            "变动",
-        )
-        is_history_query = any(kw in pure_query_lower for kw in history_compare_kws)
-
-        def _is_subj_in_query(subj_low: str) -> bool:
-            if not subj_low or subj_low == "user":
-                return False
-            if subj_low in pure_query_lower:
-                return True
-            cleaned = re.sub(
-                r"\b(my|the|a|an|friend|colleague|sister|brother|coworker|roommate)\b"
-                r"|我的|朋友|同事|同学|闺蜜|室友",
-                " ",
-                subj_low,
-            ).strip()
-            for tok in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", cleaned):
-                if len(tok) >= 2 and tok in pure_query_lower:
-                    return True
-                if (
-                    len(tok) == 1
-                    and tok in "妈爸姐哥弟妹婆爷奶妻夫姨叔舅姑嫂"
-                    and tok in pure_query_lower
-                ):
-                    return True
-            for ch in subj_low:
-                if ch in "妈爸姐哥弟妹婆爷奶妻夫姨叔舅姑嫂" and ch in pure_query_lower:
-                    return True
-            return False
-
-        active_dlg_rrf_by_seq: dict[int, float] = {}
-        for d_item in dialogue_candidates.values():
-            if d_item.metadata.get("source_tier") != "user_draft_fiction":
-                s_no = int(d_item.seq)
-                r_val = float(d_item.metadata.get("rrf_norm", 0.0))
-                if r_val > active_dlg_rrf_by_seq.get(s_no, 0.0):
-                    active_dlg_rrf_by_seq[s_no] = r_val
+        if user_id and hasattr(self.store, "get_person_profiles"):
+            profiles = self.store.get_person_profiles(user_id)
+        else:
+            profiles = {}
 
         for item in all_candidates:
             rrf_val = float(item.metadata.get("rrf_norm", 0.0))
@@ -1481,17 +1835,52 @@ class MemoryPipeline:
                 item.metadata["r_prob"] = rrf_val
                 item.score = rrf_val + latest_bonus + time_bonus
 
-            subj_lower = str(item.subject or "user").strip().casefold()
-            if (
-                subj_lower != "user"
-                or item.metadata.get("source_tier") == "other_person"
-            ):
-                if _is_subj_in_query(subj_lower):
-                    item.score += 0.10
+            # v2.4 INV-4: ONLY independent timeline summary cards are subject to person gating!
+            # Dialogue cards (restored_parent, raw_slice, etc.) are NEVER demoted by 0.35!
+            if item.kind == "timeline_summary":
+                subj = str(item.subject or "user").strip()
+                tier = str(item.metadata.get("source_tier") or "")
+                if subj.casefold() != "user" or tier == "other_person":
+                    prof = profiles.get(subj, {})
+                    aliases = prof.get("aliases", [])
+                    relations = prof.get("relations", [])
+                    if _is_subj_in_query(
+                        pure_query, subj, aliases=aliases, relations=relations
+                    ):
+                        item.score += 0.10
+                    else:
+                        item.score *= 0.35
+                        item.metadata["is_tl_demoted"] = True
+            elif item.kind in ("restored_parent", "raw_slice", "fact_item"):
+                raw_meta_subjs = item.metadata.get("subjects")
+                if raw_meta_subjs:
+                    card_subjs = raw_meta_subjs
+                elif item.subject and item.subject.casefold() != "user":
+                    card_subjs = [item.subject]
                 else:
-                    item.score *= 0.35
+                    card_subjs = []
+                for s in card_subjs:
+                    s_clean = str(s).strip()
+                    if s_clean and s_clean.casefold() != "user":
+                        prof = profiles.get(s_clean, {})
+                        aliases = prof.get("aliases", [])
+                        relations = prof.get("relations", [])
+                        if _is_subj_in_query(
+                            pure_query, s_clean, aliases=aliases, relations=relations
+                        ):
+                            item.score += 0.10
+                            break
 
-        # 6. Dynamic timeline relevance gating & D_direct / D_draft bucketing (v2.2/v2.3)
+        return all_candidates, rerank_succeeded
+
+    def _pack_with_forget_guard(
+        self,
+        request: SearchRequest,
+        all_candidates: list[MemoryCandidate],
+        dialogue_candidates: dict[str, MemoryCandidate],
+        timeline_candidates: dict[str, MemoryCandidate],
+        rerank_succeeded: bool,
+    ) -> list[MemoryCandidate]:
         if request.top_k == 1:
             ordered_for_pack = sorted(
                 all_candidates,
@@ -1521,6 +1910,8 @@ class MemoryPipeline:
             def _is_tl_eligible(t: MemoryCandidate) -> bool:
                 if t.metadata.get("is_global_constraint"):
                     return True
+                if t.metadata.get("is_tl_demoted"):
+                    return False
                 if rerank_succeeded:
                     return (
                         float(t.metadata.get("r_prob", 0.0)) >= TIMELINE_PIN_MIN_SCORE
@@ -1553,6 +1944,8 @@ class MemoryPipeline:
             d_direct: list[MemoryCandidate] = []
             overflow_long_slices: list[MemoryCandidate] = []
             seen_long_pmids: set[str] = set()
+            seen_turn_pairs: dict[str, MemoryCandidate] = {}
+
             for d in dlg_list:
                 if d.metadata.get("source_tier", "user_direct") == "user_draft_fiction":
                     continue
@@ -1561,7 +1954,58 @@ class MemoryPipeline:
                         overflow_long_slices.append(d)
                         continue
                     seen_long_pmids.add(d.parent_msg_id)
+                tp_id = str(d.metadata.get("turn_pair_id") or "")
+                if tp_id:
+                    winner = seen_turn_pairs.get(tp_id)
+                    if winner is not None:
+                        # BLOCKING-3: 合并 subjects
+                        d_subjs = d.metadata.get("subjects") or []
+                        w_subjs = winner.metadata.get("subjects") or []
+                        if d_subjs:
+                            winner.metadata["subjects"] = sorted(set(w_subjs + d_subjs))
+
+                        partner_anchor = str(d.metadata.get("raw_anchor_line") or "")
+                        cur_w_content = winner.content
+                        if partner_anchor and f"[#{d.seq} |" not in cur_w_content:
+                            w_anchor = str(winner.metadata.get("raw_anchor_line") or "")
+                            if d.seq < winner.seq and w_anchor in cur_w_content:
+                                cur_w_content = cur_w_content.replace(
+                                    w_anchor, f"{partner_anchor}\n{w_anchor}", 1
+                                )
+                            elif d.seq > winner.seq and w_anchor in cur_w_content:
+                                cur_w_content = cur_w_content.replace(
+                                    w_anchor, f"{w_anchor}\n{partner_anchor}", 1
+                                )
+                            else:
+                                cur_w_content = f"{cur_w_content}\n{partner_anchor}"
+
+                        d_fact = str(d.metadata.get("fact_line") or "").strip()
+                        if d_fact and d_fact not in cur_w_content:
+                            cur_w_content = f"{cur_w_content}\n{d_fact}"
+
+                        if "【注意：本段包含非User本人" in d.content and (
+                            "【注意：本段包含非User本人" not in cur_w_content
+                        ):
+                            for line in d.content.splitlines():
+                                if line.startswith("【注意：本段包含非User本人"):
+                                    cur_w_content = f"{line}\n{cur_w_content}"
+                                    break
+                        elif (
+                            winner.metadata.get("subjects")
+                            and "【注意：本段包含非User本人" not in cur_w_content
+                        ):
+                            subjs_str = "、".join(winner.metadata["subjects"])
+                            cur_w_content = (
+                                f"【注意：本段包含非User本人（系{subjs_str}）的信息，"
+                                f"请勿与User本人混淆】\n{cur_w_content}"
+                            )
+
+                        if approximate_tokens(cur_w_content) <= self.token_budget:
+                            winner.content = cur_w_content
+                        continue
+                    seen_turn_pairs[tp_id] = d
                 d_direct.append(d)
+
             d_draft = [
                 d
                 for d in dlg_list
@@ -1639,19 +2083,7 @@ class MemoryPipeline:
                 ]
 
         packed = pack_results(ordered_for_pack, request.top_k, self.token_budget)
-        packed = packed[: request.top_k]
-
-        return SearchResponse(
-            data=[
-                SearchItem(
-                    id=candidate.id,
-                    content=candidate.content,
-                    score=candidate.score,
-                    created_at=candidate.created_at,
-                )
-                for candidate in packed
-            ]
-        )
+        return packed[: request.top_k]
 
     async def _search_v1_compat(self, request: SearchRequest) -> SearchResponse:
         query = request.query
