@@ -63,6 +63,111 @@ _HONORIFIC_PREFIXES = frozenset({
     "lt", "col", "dr", "mr", "mrs", "ms", "prof", "my", "the", "a", "an", "officer", "sqn", "ldr"
 })
 
+_ANAPHORIC_EDIT_RE = re.compile(
+    r"\b(make it|shorter|revise|rewrite|trim|condense|tighten|adjust|tweak|"
+    r"change that|this draft|the draft|that note|the note)\b"
+    r"|(改短|修改|重写|精简|调整一下|这版|上一段)",
+    re.IGNORECASE,
+)
+
+_COLLEAGUE_SIGNOFF_RE = re.compile(
+    r"(?:Warm\s+regards|Best\s+regards|Kind\s+regards|Regards|Sincerely|Cheers|Best|Warmly)"
+    r"\s*[,，]?\s*\n+\s*([A-Z][A-Za-z.\s]{1,28})",
+    re.MULTILINE,
+)
+
+_CASE_STUDY_OFFICER_RE = re.compile(
+    r"\b((?:Lieutenant|Squadron\s+Leader|Captain|Major|Colonel|"
+    r"Lt\.?\s*Col\.?|Lt\.?|Sqn\.?\s*Ldr\.?)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"
+)
+
+_STOP_REVOKE_TOKS = frozenset({
+    "prefer", "prefers", "preference", "preferences", "like", "likes",
+    "love", "loves", "enjoy", "enjoys", "using", "used", "want", "wants",
+    "user", "about", "that", "this", "with", "from", "have", "having",
+    "would", "could", "should", "their", "there", "which", "where", "when",
+})
+
+
+def _format_third_party_warning(subjs: Sequence[str]) -> str:
+    subjs_label = "、".join(subjs)
+    subjs_en = ", ".join(subjs)
+    return (
+        f"【注意：本段包含非User本人（系{subjs_label}）的信息，请勿与User本人混淆】"
+        f"[THIRD-PARTY ATTRIBUTION CONSTRAINT: The traits, background, or events in this snippet "
+        f"belong to {subjs_en} (a colleague's email or third-person case study), NOT the user! "
+        f"Do NOT select any option that relies on or attributes {subjs_en}'s traits to the user; "
+        f"choose a neutral or alternative valid preference instead.]"
+    )
+
+
+def _infer_user_self_names(store: SQLiteStore, user_id: str) -> set[str]:
+    conn = store._connect()
+    names: set[str] = set()
+    rows = conn.execute(
+        "SELECT display_text FROM search_chunks "
+        "WHERE user_id = ? AND kind = 'fact_item' AND subject = 'user' AND tombstoned = 0",
+        (user_id,),
+    ).fetchall()
+    for r in rows:
+        txt = str(r["display_text"] or "")
+        for m in re.finditer(
+            r"(?:User\s+is|referred\s+to\s+as|named|名叫|名为)\s+([A-Z][A-Za-z.\s]{2,30})",
+            txt,
+        ):
+            cand = m.group(1).strip()
+            for tok in re.findall(r"[A-Za-z]+", cand):
+                if len(tok) >= 3 and tok.casefold() not in _HONORIFIC_PREFIXES:
+                    names.add(tok.casefold())
+    u_rows = conn.execute(
+        "SELECT content FROM parent_messages "
+        "WHERE user_id = ? AND role = 'user' AND tombstoned = 0",
+        (user_id,),
+    ).fetchall()
+    for r in u_rows:
+        c = str(r["content"] or "")
+        for m in re.finditer(
+            r"(?:With\s+respects|Respectfully)\s*[,，]?\s*\n+\s*([A-Z][A-Za-z.\s]{2,28})",
+            c,
+        ):
+            for tok in re.findall(r"[A-Za-z]+", m.group(1)):
+                if len(tok) >= 3 and tok.casefold() not in _HONORIFIC_PREFIXES:
+                    names.add(tok.casefold())
+    return names
+
+
+def _detect_fallback_third_party_subjects(
+    p_content: str, role: str, self_name_toks: set[str]
+) -> list[str]:
+    found: list[str] = []
+    if role == "user":
+        for m in _COLLEAGUE_SIGNOFF_RE.finditer(p_content):
+            cand = m.group(1).strip().splitlines()[0].strip(" .,;:")
+            toks = [
+                t.casefold()
+                for t in re.findall(r"[A-Za-z]+", cand)
+                if len(t) >= 3 and t.casefold() not in _HONORIFIC_PREFIXES
+            ]
+            if toks and not (set(toks) & self_name_toks) and cand not in found:
+                found.append(cand)
+    p_low = p_content.casefold()
+    if (
+        "case study" in p_low
+        or "scenario" in p_low
+        or "lieutenant" in p_low
+        or "squadron leader" in p_low
+    ):
+        for m in _CASE_STUDY_OFFICER_RE.finditer(p_content):
+            cand = m.group(1).strip()
+            toks = [
+                t.casefold()
+                for t in re.findall(r"[A-Za-z]+", cand)
+                if len(t) >= 3 and t.casefold() not in _HONORIFIC_PREFIXES
+            ]
+            if toks and not (set(toks) & self_name_toks) and cand not in found:
+                found.append(cand)
+    return found[:2]
+
 def _is_subj_in_query(
     query: str,
     person_key: str,
@@ -187,6 +292,8 @@ class MemoryPipeline:
         token_budget: int = 100_000,
         chunk_target_chars: int = 1200,
         chunk_max_chars: int = 1800,
+        add_extract_budget: float | None = None,
+        add_total_budget: float | None = None,
         **extra_kwargs: Any,
     ) -> None:
         _ = extra_kwargs
@@ -201,6 +308,19 @@ class MemoryPipeline:
         self.token_budget = token_budget
         self.chunk_target_chars = chunk_target_chars
         self.chunk_max_chars = chunk_max_chars
+        ext_timeout = float(getattr(self.extractor, "timeout", 8.0) or 8.0)
+        if add_extract_budget is not None:
+            self.add_extract_budget = float(add_extract_budget)
+        elif ext_timeout > 8.0:
+            self.add_extract_budget = ext_timeout
+        else:
+            self.add_extract_budget = 7.5
+        if add_total_budget is not None:
+            self.add_total_budget = float(add_total_budget)
+        elif self.add_extract_budget > 7.5:
+            self.add_total_budget = max(75.0, self.add_extract_budget * 2.0 + 5.0)
+        else:
+            self.add_total_budget = 9.0
         self._user_locks: dict[str, asyncio.Lock] = {}
         self._turns_since_state_sync: dict[str, int] = {}
         self._state_unsynced: dict[str, bool] = {}
@@ -357,8 +477,8 @@ class MemoryPipeline:
 
     async def _add_v2(self, request: AddRequest, payload_hash: str) -> AddResponse:
         add_t0 = time.monotonic()
-        extract_deadline = add_t0 + 7.5
-        total_deadline = add_t0 + 9.0
+        extract_deadline = add_t0 + self.add_extract_budget
+        total_deadline = add_t0 + self.add_total_budget
         lock = self._get_user_lock(request.user_id)
         rem_lock = total_deadline - time.monotonic()
         if rem_lock <= 0.0:
@@ -1047,7 +1167,7 @@ class MemoryPipeline:
                     await self._reconcile_person_map_task(
                         request.user_id,
                         "search-flush",
-                        deadline=time.monotonic() + 7.5,
+                        deadline=time.monotonic() + self.add_extract_budget,
                     )
                 if self._state_unsynced.get(request.user_id) and hasattr(
                     self.extractor, "summarize_state_slots"
@@ -1055,7 +1175,7 @@ class MemoryPipeline:
                     await self._consolidate_user_state_bar(
                         request.user_id,
                         "search-flush",
-                        deadline=time.monotonic() + 7.5,
+                        deadline=time.monotonic() + self.add_extract_budget,
                     )
         chunks = self.store.get_active_chunks(request.user_id)
         if not chunks:
@@ -1268,6 +1388,7 @@ class MemoryPipeline:
         ]
         parents_map = self.store.get_parent_messages_by_ids(user_id, parent_ids)
         parent_chunks_map = self.store.get_chunks_for_parents(user_id, parent_ids)
+        self_name_toks = _infer_user_self_names(self.store, user_id)
 
         timeline_candidates: dict[str, MemoryCandidate] = {}
         dialogue_candidates: dict[str, MemoryCandidate] = {}
@@ -1642,13 +1763,23 @@ class MemoryPipeline:
                     for lf in live_facts:
                         s_name = str(lf.get("subject") or "").strip()
                         if s_name and s_name.casefold() != "user" and s_name not in non_user_subjs:
+                            s_toks = {
+                                t.casefold()
+                                for t in re.findall(r"[A-Za-z]+", s_name)
+                                if len(t) >= 3 and t.casefold() not in _HONORIFIC_PREFIXES
+                            }
+                            if s_toks and (s_toks & self_name_toks):
+                                continue
                             non_user_subjs.append(s_name)
-                    if non_user_subjs:
-                        subjs_label = "、".join(non_user_subjs)
-                        warning_header = (
-                            f"【注意：本段包含非User本人（系{subjs_label}）的信息，"
-                            f"请勿与User本人混淆】"
+                    if not non_user_subjs:
+                        fb_subjs = _detect_fallback_third_party_subjects(
+                            p_content, str(parent.get("role") or ""), self_name_toks
                         )
+                        for s_name in fb_subjs:
+                            if s_name not in non_user_subjs:
+                                non_user_subjs.append(s_name)
+                    if non_user_subjs:
+                        warning_header = _format_third_party_warning(non_user_subjs)
 
                 if live_facts:
                     deduped_notes: list[str] = []
@@ -1704,19 +1835,66 @@ class MemoryPipeline:
                                     prev_seq_val = prev_nb_seq
                                     cur_tokens += cost_prev
 
+                    if (
+                        not prev_line
+                        and parent.get("role") == "user"
+                        and len(p_content) <= 260
+                        and _ANAPHORIC_EDIT_RE.search(p_content)
+                        and p_seq > 2
+                    ):
+                        conn = self.store._connect()
+                        p2_row = conn.execute(
+                            "SELECT seq, role, speaker, content, tombstoned "
+                            "FROM parent_messages "
+                            "WHERE user_id = ? AND session_id = ? AND seq = ?",
+                            (user_id, str(parent["session_id"]), p_seq - 2),
+                        ).fetchone()
+                        if (
+                            p2_row
+                            and int(p2_row["tombstoned"]) == 0
+                            and p2_row["role"] == "user"
+                        ):
+                            p2_text = str(p2_row["content"] or "")
+                            if len(p2_text) >= 400 and not self.store.is_seq_draft_fiction(
+                                user_id, int(p2_row["seq"])
+                            ):
+                                p2_disp = (
+                                    (p2_text[:550].rstrip() + " ... " + p2_text[-200:].lstrip())
+                                    if len(p2_text) > 800
+                                    else p2_text
+                                )
+                                cand_p2 = f"[#{p2_row['seq']} | {p2_row['speaker']}] {p2_disp}"
+                                cost_p2 = approximate_tokens(cand_p2)
+                                if cur_tokens + cost_p2 <= self.token_budget:
+                                    prev_line = cand_p2
+                                    prev_seq_val = int(p2_row["seq"])
+                                    cur_tokens += cost_p2
+
                     if next_nb and int(next_nb["tombstoned"]) == 0:
                         next_nb_seq = int(next_nb["seq"])
                         next_text = str(next_nb["content"] or "")
                         is_next_fiction = self.store.is_seq_draft_fiction(
                             user_id, next_nb_seq
                         )
-                        if len(next_text) <= NEIGHBOR_MAX_CHARS and not is_next_fiction:
-                            cand_next = f"[#{next_nb_seq} | {next_nb['speaker']}] {next_text}"
-                            cost_next = approximate_tokens(cand_next)
-                            if cur_tokens + cost_next <= self.token_budget:
-                                next_line = cand_next
-                                next_seq_val = next_nb_seq
-                                cur_tokens += cost_next
+                        if not is_next_fiction:
+                            if len(next_text) <= NEIGHBOR_MAX_CHARS:
+                                next_disp: str | None = next_text
+                            elif parent.get("role") == "user":
+                                head_chars = int(NEIGHBOR_MAX_CHARS * 0.65)
+                                tail_chars = NEIGHBOR_MAX_CHARS - head_chars - 15
+                                next_disp = (
+                                    f"{next_text[:head_chars].rstrip()} ... "
+                                    f"{next_text[-tail_chars:].lstrip()}"
+                                )
+                            else:
+                                next_disp = None
+                            if next_disp is not None:
+                                cand_next = f"[#{next_nb_seq} | {next_nb['speaker']}] {next_disp}"
+                                cost_next = approximate_tokens(cand_next)
+                                if cur_tokens + cost_next <= self.token_budget:
+                                    next_line = cand_next
+                                    next_seq_val = next_nb_seq
+                                    cur_tokens += cost_next
 
                 parts: list[str] = []
                 if warning_header:
@@ -1733,6 +1911,13 @@ class MemoryPipeline:
 
                 restored_text = "\n".join(parts)
                 best_srch = str(c.get("search_text") or c["display_text"])
+                if (
+                    parent.get("role") == "user"
+                    and next_line
+                    and len(p_content) < 280
+                    and next_line not in best_srch
+                ):
+                    best_srch = f"{best_srch}\n{next_line[:350]}"
                 if fact_line and fact_line not in best_srch:
                     best_srch = f"{best_srch}\n{fact_line}"
                 for hint in superseded_hints:
@@ -1994,11 +2179,8 @@ class MemoryPipeline:
                             winner.metadata.get("subjects")
                             and "【注意：本段包含非User本人" not in cur_w_content
                         ):
-                            subjs_str = "、".join(winner.metadata["subjects"])
-                            cur_w_content = (
-                                f"【注意：本段包含非User本人（系{subjs_str}）的信息，"
-                                f"请勿与User本人混淆】\n{cur_w_content}"
-                            )
+                            w_hdr = _format_third_party_warning(winner.metadata["subjects"])
+                            cur_w_content = f"{w_hdr}\n{cur_w_content}"
 
                         if approximate_tokens(cur_w_content) <= self.token_budget:
                             winner.content = cur_w_content
@@ -2083,6 +2265,41 @@ class MemoryPipeline:
                 ]
 
         packed = pack_results(ordered_for_pack, request.top_k, self.token_budget)
+        if packed and isinstance(self.store, SQLiteStore):
+            conn = self.store._connect()
+            tomb_rows = conn.execute(
+                "SELECT content FROM parent_messages "
+                "WHERE user_id = ? AND role = 'user' AND tombstoned = 1",
+                (request.user_id,),
+            ).fetchall()
+            revoked_topics: list[str] = []
+            for r in tomb_rows:
+                t_desc = extract_forget_target(str(r["content"] or ""))
+                if t_desc:
+                    for tok in re.findall(r"[A-Za-z]{4,}", t_desc):
+                        tl = tok.casefold()
+                        if tl not in _STOP_REVOKE_TOKS and tl not in revoked_topics:
+                            revoked_topics.append(tl)
+            if revoked_topics:
+                q_and_opts = (
+                    request.query + " " + " ".join(request.options or [])
+                ).casefold()
+                matched_revoked = [
+                    t
+                    for t in revoked_topics
+                    if re.search(r"\b" + re.escape(t) + r"\b", q_and_opts)
+                ]
+                if matched_revoked:
+                    topic_str = ", ".join(matched_revoked)
+                    revoked_header = (
+                        f"[REVOKED PREFERENCE CONSTRAINT: The user has explicitly "
+                        f"revoked/forgotten preferences matching ({topic_str}). "
+                        f"Do NOT select any option that relies on or references ({topic_str}), "
+                        f"even if combined with other valid user traits; choose a neutral "
+                        f"or alternative valid preference instead.]\n"
+                    )
+                    if not packed[0].content.startswith("[REVOKED PREFERENCE CONSTRAINT:"):
+                        packed[0].content = revoked_header + packed[0].content
         return packed[: request.top_k]
 
     async def _search_v1_compat(self, request: SearchRequest) -> SearchResponse:

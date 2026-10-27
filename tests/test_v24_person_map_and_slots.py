@@ -1817,3 +1817,230 @@ async def test_fine_grained_slot_latest_and_superseded_hint_with_mixed_turn_guar
         "该对话卡的 is_latest_in_tag 必须保留为 True，严禁被整卡标记为已过期！"
     )
 
+
+@pytest.mark.asyncio
+async def test_v242_context_person_and_revoked_guards(db_path: Path):
+    """v2.4.2 契约回归：
+    1. B1: apply_person_map_updates 拒绝 from=='user' 的吞并，且拒绝无字面依据的 move_slots；
+    2. B2: 用户锚点卡面对超 1000 字符的 assistant 回复时平滑截断保留，短修改轮附带 p_seq-2 草稿；
+    3. B3: 同事落款邮件/案例触发中英双语归属约束，且用户本人姓名绝不被误标为第三方；
+    4. B4: 已撤回偏好命中 Query/Options 时，卡片首部自动注入 [REVOKED PREFERENCE CONSTRAINT]。
+    """
+    user_id = "user_v242_guards"
+    session_id = "sess_v242_01"
+
+    extractor = FakeExtractor(
+        responses=[
+            # Round 1: User 家庭事实 + 邮件草稿
+            {
+                "facts": [
+                    {
+                        "seq": 1,
+                        "who": "user",
+                        "tag": "家庭/子女",
+                        "fact": "User took Rahul and Ishaan to the park",
+                        "current_state": "took Rahul and Ishaan to the park",
+                        "is_fiction": False,
+                    },
+                    {
+                        "seq": 1,
+                        "who": "user",
+                        "tag": "个人身份",
+                        "fact": "User is Ananya Sharma",
+                        "current_state": "Ananya Sharma",
+                        "is_fiction": False,
+                    },
+                ],
+                "forget_actions": [],
+            },
+            # Round 2: 短指代修改轮 + 长回复
+            {"facts": [], "forget_actions": []},
+            # Round 3: 同事邮件 (无提取出的 other_person 事实，测试 fallback 检测)
+            {"facts": [], "forget_actions": []},
+            # Round 4: 偏好写入与撤回
+            {
+                "facts": [
+                    {
+                        "seq": 7,
+                        "who": "user",
+                        "tag": "工具偏好",
+                        "fact": "User enjoys using Trello for project tracking",
+                        "current_state": "enjoys using Trello",
+                        "is_fiction": False,
+                    }
+                ],
+                "forget_actions": [
+                    {
+                        "trigger_seq": 9,
+                        "batch_seqs_to_tombstone": [7, 8, 9],
+                        "target_existing_tags": ["工具偏好"],
+                        "target_keywords": ["trello"],
+                        "target_description": "my preference for using Trello",
+                    }
+                ],
+            },
+        ]
+    )
+
+    pipeline, store, _, _, _ = build_v2_pipeline(
+        db_path=db_path,
+        extractor=extractor,
+        reranker=FakeReranker(keyword_scores={"park": 0.9, "shorter": 0.9, "Priya": 0.9}),
+    )
+
+    long_draft = (
+        "Here is my draft note to the team about our upcoming schedule and deliverables. " * 8
+    )
+    long_assistant_reply = (
+        "Sure! Here is a detailed breakdown of the schedule with bullet points and action items. "
+        * 15
+    )
+
+    # Round 1 (seq 1 & 2)
+    await pipeline.add(
+        AddRequest(
+            request_id="req-v242-01",
+            user_id=user_id,
+            session_id=session_id,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Last Saturday I took Rahul and Ishaan to the park. {long_draft}",
+                    "timestamp": 1000,
+                },
+                {
+                    "role": "assistant",
+                    "content": "That sounds like a great weekend!",
+                    "timestamp": 1001,
+                },
+            ],
+        )
+    )
+
+    # B1 验证：试图将 user 合并给 Rahul，以及试图将 F1 无依据移交给 Rachel
+    store.apply_person_map_updates(
+        user_id=user_id,
+        session_id=session_id,
+        merge_persons=[{"from": "user", "to": "Rahul"}],
+        move_slots=[{"fid": "F1", "to": "Rachel"}],
+        profile_updates=[],
+    )
+    conn = store._connect()
+    f1_row = conn.execute(
+        "SELECT subject FROM tag_timelines WHERE user_id = ? AND slot_id = 'F1'",
+        (user_id,),
+    ).fetchone()
+    assert f1_row is not None and f1_row["subject"] == "user", (
+        "B1 守卫：严禁将 user 全量合并给他人，也严禁将无 Rachel 字面证据的 F1 移交给 Rachel"
+    )
+
+    # Round 2 (seq 3 & 4): 短指代修改轮 + 超过 1000 字符的 assistant 回复
+    await pipeline.add(
+        AddRequest(
+            request_id="req-v242-02",
+            user_id=user_id,
+            session_id=session_id,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Could you make it shorter and tighten the draft?",
+                    "timestamp": 2000,
+                },
+                {
+                    "role": "assistant",
+                    "content": long_assistant_reply,
+                    "timestamp": 2001,
+                },
+            ],
+        )
+    )
+
+    res_edit = await pipeline.search(
+        SearchRequest(user_id=user_id, query="make it shorter tighten draft", top_k=5)
+    )
+    edit_card = next((c for c in res_edit.data if "[#3 | user" in c.content), None)
+    assert edit_card is not None
+    assert "[#1 | user]" in edit_card.content, (
+        "B2 守卫：短指代修改轮应自动附带 p_seq-2 的长草稿上下文"
+    )
+    assert "[#4 | assistant]" in edit_card.content, (
+        "B2 守卫：用户锚点卡面对超 1000 字符的 assistant 回复应平滑截断保留而非整段丢弃"
+    )
+
+    # Round 3 (seq 5 & 6): 同事 Priya 落款邮件
+    await pipeline.add(
+        AddRequest(
+            request_id="req-v242-03",
+            user_id=user_id,
+            session_id=session_id,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Can you help me reply to this email from my colleague?\n\n"
+                        "Hi Ananya,\nI just adopted a golden retriever puppy!\n"
+                        "Warm regards,\nPriya"
+                    ),
+                    "timestamp": 3000,
+                },
+                {
+                    "role": "assistant",
+                    "content": "Here is a warm reply congratulating Priya.",
+                    "timestamp": 3001,
+                },
+            ],
+        )
+    )
+
+    res_priya = await pipeline.search(
+        SearchRequest(user_id=user_id, query="golden retriever puppy Priya", top_k=5)
+    )
+    priya_card = next((c for c in res_priya.data if "golden retriever" in c.content), None)
+    assert priya_card is not None
+    assert "THIRD-PARTY ATTRIBUTION CONSTRAINT" in priya_card.content
+    assert "Priya" in priya_card.content
+
+    # Round 4 (seq 7..10): 偏好写入并显式遗忘 Trello
+    await pipeline.add(
+        AddRequest(
+            request_id="req-v242-04",
+            user_id=user_id,
+            session_id=session_id,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "I really enjoy using Trello for project tracking.",
+                    "timestamp": 4000,
+                },
+                {
+                    "role": "assistant",
+                    "content": "Got it, Trello is great for boards.",
+                    "timestamp": 4001,
+                },
+                {
+                    "role": "user",
+                    "content": "Please forget my preference for using Trello.",
+                    "timestamp": 4002,
+                },
+                {
+                    "role": "assistant",
+                    "content": "I have forgotten your preference for Trello.",
+                    "timestamp": 4003,
+                },
+            ],
+        )
+    )
+
+    res_revoke = await pipeline.search(
+        SearchRequest(
+            user_id=user_id,
+            query="Which project tool should I use?",
+            options=["Use Trello boards for sprint tracking", "Use a standard checklist"],
+            top_k=5,
+        )
+    )
+    assert len(res_revoke.data) > 0
+    assert "[REVOKED PREFERENCE CONSTRAINT:" in res_revoke.data[0].content
+    assert "trello" in res_revoke.data[0].content.casefold()
+
+
