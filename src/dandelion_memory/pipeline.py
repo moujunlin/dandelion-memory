@@ -30,10 +30,12 @@ from .reranker import NoOpReranker, Reranker
 from .store import MemoryStore, SQLiteStore, cosine_similarity
 from .text import (
     LONG_DOC_CHAR_THRESHOLD,
+    _stem_en_word,
     add_temporal_hints,
     approximate_tokens,
     build_bm25_tokens,
     extract_forget_target,
+    extract_keywords_from_target,
     extract_query_time_range,
     extract_speaker,
     format_session_time_str,
@@ -69,6 +71,105 @@ _ANAPHORIC_EDIT_RE = re.compile(
     r"|(改短|修改|重写|精简|调整一下|这版|上一段)",
     re.IGNORECASE,
 )
+
+_TAG_NEUTRAL_TOPIC_FALLBACK: dict[str, str] = {
+    "饮食/喜好": (
+        "日常饮食与备餐计划方式（meal planning, food prep scheduling, and dietary preferences）"
+    ),
+    "饮食/禁忌": "日常饮食禁忌与备餐安排（dietary restrictions and meal planning preferences）",
+    "饮食/口味与禁忌": (
+        "日常饮食与备餐计划方式（meal planning, food prep scheduling, and dietary preferences）"
+    ),
+    "爱好/娱乐与文艺": (
+        "日常休闲与旅途娱乐活动（leisure activities, engaging travel pastimes, "
+        "and weekend entertainment events）"
+    ),
+    "行程/旅行与计划": (
+        "日常出行与旅途休闲安排（travel routines and on-the-go leisure preferences）"
+    ),
+    "健康/运动与作息": (
+        "日常运动健身与作息方式（exercise, fitness routines, and daily rest habits）"
+    ),
+    "爱好/运动与健身": (
+        "日常运动健身与作息方式（exercise, fitness routines, and daily rest habits）"
+    ),
+    "居住/地点": "日常居住与通勤方式（living location and commute preferences）",
+    "生活/居住与出行": "日常居住与通勤方式（living location and commute preferences）",
+    "工具与数字偏好/软件与硬件": (
+        "日常软件应用与规划工具（software apps and digital planning tools）"
+    ),
+    "职业/工作与头衔": "日常工作与数字化工具方式（work tools and professional preferences）",
+    "职业/技能与技术栈": "日常工作与数字化工具方式（work tools, apps, and planning methods）",
+    "工作与学业/职业与技能": "日常工作与学习工具方式（work and study tools or methods）",
+    "资产/物品与车辆": "日常随身物品与出行工具（personal items and vehicles）",
+    "消费与财务/购物与预算": "日常消费与预算方式（shopping and budgeting habits）",
+}
+
+
+def _sanitize_neutral_topic(
+    raw_topic: str,
+    target_keywords: Sequence[str],
+    forget_msg_content: str,
+    target_tags: Sequence[str],
+) -> str:
+    """Strip any forbidden forgotten keywords/stems from neutral_topic and fallback to category."""
+    base_tag = get_base_tag(target_tags[0]) if target_tags else ""
+    fallback = _TAG_NEUTRAL_TOPIC_FALLBACK.get(
+        base_tag, "相关日常偏好（related personal preference）"
+    )
+    kw_sources = list(target_keywords)
+    if not kw_sources and forget_msg_content:
+        msg_target = extract_forget_target(forget_msg_content)
+        if msg_target:
+            kw_sources.extend(extract_keywords_from_target(msg_target))
+
+    forbidden_en: set[str] = set()
+    forbidden_cjk: list[str] = []
+    for kw in kw_sources:
+        kw_str = str(kw or "").strip()
+        if not kw_str:
+            continue
+        en_toks = re.findall(r"[a-z0-9]+", kw_str.casefold())
+        # Only add individual English tokens to forbidden_en for single-word keywords;
+        # multi-word keywords (e.g., "meal-prep apps") are stripped as full phrases so
+        # generic topic words ("meal", "cooking") are preserved in neutral_topic.
+        if len(en_toks) == 1 and len(en_toks[0]) >= 3:
+            w = en_toks[0]
+            forbidden_en.add(w)
+            stem = _stem_en_word(w)
+            if stem and len(stem) >= 3:
+                forbidden_en.add(stem)
+        for cjk in re.findall(r"[\u4e00-\u9fff]{2,}", kw_str):
+            forbidden_cjk.append(cjk)
+
+    def _clean_text(text: str) -> str:
+        out = text
+        for kw in kw_sources:
+            kw_s = str(kw or "").strip()
+            if len(kw_s) >= 2:
+                out = re.sub(re.escape(kw_s), " ", out, flags=re.IGNORECASE)
+                if kw_s.lower().endswith("s") and len(kw_s) >= 4:
+                    out = re.sub(re.escape(kw_s[:-1]), " ", out, flags=re.IGNORECASE)
+        for cjk in forbidden_cjk:
+            out = out.replace(cjk, " ")
+        if forbidden_en:
+            def _repl_en(m: re.Match[str]) -> str:
+                tok = m.group(0)
+                low = tok.casefold()
+                stem = _stem_en_word(low) or low
+                if low in forbidden_en or stem in forbidden_en:
+                    return ""
+                return tok
+
+            out = re.sub(r"[A-Za-z0-9]+", _repl_en, out)
+        out = re.sub(r"\s{2,}", " ", out).strip(" ,;/-|()（）")
+        return out
+
+    cleaned_raw = _clean_text(str(raw_topic or "").strip())
+    if len(cleaned_raw) >= 4:
+        return cleaned_raw
+    cleaned_fb = _clean_text(fallback)
+    return cleaned_fb or "相关日常偏好（related personal preference）"
 
 
 def _is_subj_in_query(
@@ -676,11 +777,43 @@ class MemoryPipeline:
                 continue
             if not has_explicit_forget_keyword(str(trig_rec["content"])):
                 continue
+            neutral_state_text = ""
+            neutral_fact_text = ""
+            neutral_embed_input = ""
+            neutral_tag = f"其他/偏好撤回#{fa.trigger_seq}"
+            neutral_slot_id = f"FN{fa.trigger_seq}"
+            if bool(fa.neutral_topic.strip()) or use_two_pass:
+                clean_topic = _sanitize_neutral_topic(
+                    fa.neutral_topic,
+                    fa.target_keywords,
+                    str(trig_rec["content"] or ""),
+                    fa.target_existing_tags,
+                )
+                neutral_fact_text = (
+                    f"用户已主动撤回并清空关于「{clean_topic}」的既有个人偏好记录 "
+                    f"(PREFERENCE CLEARED on {clean_topic}: User explicitly cleared their "
+                    f"previous specific preference on {clean_topic}; no specific preference is "
+                    f"currently recorded on file. When answering a question about {clean_topic}, "
+                    f"you MUST choose the purely general, everyday, unpersonalized option that "
+                    f"does NOT assume any specific app/tool/activity and does NOT tie into the "
+                    f"user's profession, duty schedule, or cultural background.)"
+                )
+                neutral_state_text = (
+                    f"[状态槽位 {neutral_slot_id} | user | {neutral_tag}] "
+                    f"当前状态: {neutral_fact_text}"
+                )
+                neutral_embed_input = f"[user | {neutral_tag}] {clean_topic} {neutral_fact_text}"
             valid_forgets.append(
                 {
                     "fa": fa,
                     "trig_rec": trig_rec,
                     "target_vec": None,
+                    "neutral_slot_id": neutral_slot_id,
+                    "neutral_tag": neutral_tag,
+                    "neutral_state_text": neutral_state_text,
+                    "neutral_fact_text": neutral_fact_text,
+                    "neutral_embed_input": neutral_embed_input,
+                    "neutral_vec": [],
                 }
             )
 
@@ -690,12 +823,17 @@ class MemoryPipeline:
             *(pf["embed_input"] for pf in prepared_facts),
         ]
         forget_embed_indices: list[tuple[int, int]] = []
+        neutral_embed_indices: list[tuple[int, int]] = []
         for vf_idx, vf in enumerate(valid_forgets):
             _check_deadline()
             desc = vf["fa"].target_description
             if desc:
                 forget_embed_indices.append((vf_idx, len(all_embed_inputs)))
                 all_embed_inputs.append(desc)
+            n_emb = vf.get("neutral_embed_input")
+            if n_emb:
+                neutral_embed_indices.append((vf_idx, len(all_embed_inputs)))
+                all_embed_inputs.append(str(n_emb))
 
         if all_embed_inputs:
             rem_emb = total_deadline - time.monotonic()
@@ -710,6 +848,8 @@ class MemoryPipeline:
                 pf["vector"] = all_vecs[n_raw + pf_idx]
             for vf_idx, emb_idx in forget_embed_indices:
                 valid_forgets[vf_idx]["target_vec"] = all_vecs[emb_idx]
+            for vf_idx, emb_idx in neutral_embed_indices:
+                valid_forgets[vf_idx]["neutral_vec"] = all_vecs[emb_idx]
 
         _check_deadline()
 
@@ -958,6 +1098,66 @@ class MemoryPipeline:
                 dirty_keys=dirty_timeline_keys,
             )
             _check_deadline()
+
+            if valid_forgets:
+                if hasattr(self.store, "_connect"):
+                    self.store._connect().execute(
+                        "UPDATE search_chunks SET tombstoned = 0 "
+                        "WHERE user_id = ? AND slot_id LIKE 'FN%'",
+                        (request.user_id,),
+                    )
+                for vf in valid_forgets:
+                    _check_deadline()
+                    n_state = vf.get("neutral_state_text")
+                    n_fact = vf.get("neutral_fact_text")
+                    n_emb = vf.get("neutral_embed_input")
+                    if not (n_state and n_fact and n_emb):
+                        continue
+                    trig_rec = vf["trig_rec"]
+                    n_slot = str(vf["neutral_slot_id"])
+                    n_tag = str(vf["neutral_tag"])
+                    n_vec = vf.get("neutral_vec") or []
+                    n_bm25 = build_bm25_tokens(str(n_emb), subject="user", tag=n_tag)
+                    self.store.upsert_chunk(
+                        chunk_id=f"tl:{request.user_id}:{n_slot}",
+                        user_id=request.user_id,
+                        session_id=request.session_id,
+                        parent_msg_id=None,
+                        slot_id=n_slot,
+                        seq=0,
+                        session_ts=trig_rec["session_ts"],
+                        kind="timeline_summary",
+                        subject="user",
+                        tag=n_tag,
+                        source_tier="user_direct",
+                        display_text=str(n_state),
+                        search_text=str(n_emb),
+                        bm25_tokens=n_bm25,
+                        event_time_start=trig_rec["session_ts"],
+                        event_time_end=trig_rec["session_ts"],
+                        embedding=n_vec,
+                        tombstoned=0,
+                    )
+                    self.store.upsert_chunk(
+                        chunk_id=f"fact:{request.user_id}:{n_slot}",
+                        user_id=request.user_id,
+                        session_id=request.session_id,
+                        parent_msg_id=str(trig_rec["msg_id"]),
+                        slot_id=n_slot,
+                        seq=0,
+                        session_ts=trig_rec["session_ts"],
+                        kind="fact_item",
+                        subject="user",
+                        tag=n_tag,
+                        source_tier="user_direct",
+                        display_text=str(n_fact),
+                        search_text=str(n_emb),
+                        bm25_tokens=n_bm25,
+                        event_time_start=trig_rec["session_ts"],
+                        event_time_end=trig_rec["session_ts"],
+                        embedding=n_vec,
+                        tombstoned=0,
+                    )
 
             self.store.record_add_request(
                 request_id=request.request_id,

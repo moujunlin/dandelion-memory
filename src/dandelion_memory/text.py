@@ -640,6 +640,7 @@ def regex_extract_batch(messages: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 "target_existing_tags": [],
                 "target_keywords": extract_keywords_from_target(target),
                 "target_description": target,
+                "neutral_topic": "",
                 "batch_seqs_to_tombstone": batch_seqs,
             }
         )
