@@ -15,6 +15,7 @@ from .text import (
     extract_keywords_from_target,
     format_session_time_str,
     has_explicit_forget_keyword,
+    infer_user_self_names,
     regex_extract_batch,
 )
 
@@ -119,6 +120,7 @@ _SYSTEM_PROMPT = """你是 Dandelion Memory v2.4 的写入侧无状态记忆事�
       "relations": [],
       "tag": "一级分类/二级标签",
       "fact": "包含核心实体与数值的事实陈述",
+      "implied": "仅当原句含随身物品动作/身体反应/术后恢复提问时填1~3个规范上位词，否则填 \"\"",
       "is_fiction": false,
       "date": "YYYY-MM-DD"
     }
@@ -146,11 +148,21 @@ _SYSTEM_PROMPT = """你是 Dandelion Memory v2.4 的写入侧无状态记忆事�
      或明确复述用户既往偏好（如 `Since you enjoy...`）时，才必须从该 `Original` 原始文稿段落中
      提取事实并填该 `assistant` 的 `#seq`；严禁从 AI 改写后的 `Revised / Improved` 版本中提取！
 3. 文稿/邮件场景下的「本人隐式日常细节 + 第三方人物归属」双提准则：
-   - `"who": "user"`（本人必提）：在用户的个人邮件、工作汇报、日常记录或 `Original` 原文块中，
-     凡第一人称（`I / my`）顺带提及的通勤交通工具、穿戴/随身物品（如眼镜镜框、手腕穿戴设备）、
-     高强度工作间隙的休息方式、晨间呼吸/作息习惯、饮食或家庭细节，必须提取为 `"who": "user"`
-     的事实，并在 `"fact"` 中同时写出原文字面动作与直接对应的日常含义（注意：即使用户在邮件落款
-     署了自己的真名，只要是用户本人，`"who"` 必须填 `"user"`，切勿填用户真名！）；
+   - `"who": "user"`（本人必提与第一人称信件落款归属）：在用户的个人邮件、工作汇报、
+     日常记录或 `Original` 原文块中，凡第一人称（`I / my`）顺带提及的通勤交通工具、
+     穿戴/随身物品（如眼镜镜框、手腕穿戴设备）、高强度工作间隙的休息方式、
+     晨间呼吸/作息习惯、饮食或家庭细节，必须提取为 `"who": "user"` 的事实，
+     并在 `"fact"` 中同时写出原文字面动作与直接对应的日常含义。
+     若 User 消息或 `assistant` 消息中引用的 `Original message:` / `Original:` 原文块
+     以第一人称（`I / my / we / 我`）撰写信件、邮件或草稿，且在末尾落款签名
+     （如 `Best, X` / `Warm regards, X` / `Respectfully, X` / `Sincerely, X` / `— X`），
+     该信件/邮件均为用户本人所写，签名 `X` 是 **User 本人的名字**
+     （可提取一条 `"who": "user"` 的 `身份/姓名` 事实 `"User is X"`），
+     文中以 `"I / my / we"` 叙述的行动、饮食、计划等事实**必须归属于 `"who": "user"`，
+     绝不能填 `"who": "X"`**，严禁因为末尾有姓名落款或由 assistant 引用
+     就将整段第一人称内容标成 `"who": "X"` 第三人称！
+     （注意：即使在邮件落款署了真名，只要是第一人称信件，
+     `"who"` 必须填 `"user"`，切勿填 `"who": "X"`！）；
    - `"who": "<具体他人姓名或称呼>"`（第三方必提）：
      (a) 转发他人来信（如用户说明是来自某同事的邮件，或邮件开头称呼用户 `"Hi <User>,"`、
          末尾落款署名为他人）：来信正文中的经历、居住环境、喜好归属于**发件人**，
@@ -206,6 +218,7 @@ class ExtractedFact:
     aliases: list[str] = field(default_factory=list)
     relations: list[str] = field(default_factory=list)
     is_v24: bool = False
+    implied: str = ""
 
 
 @dataclass(slots=True)
@@ -261,14 +274,17 @@ NoOpExtractor = RegexExtractor
 
 
 class DashScopeExtractor:
-    """Module B LLM extractor calling OpenAI-compatible /chat/completions with 8.0s timeout."""
+    """Module B LLM extractor calling OpenAI-compatible /chat/completions with 8.0s timeout.
+
+    Default model: gpt-4o-mini.
+    """
 
     def __init__(
         self,
         *,
         api_key: str,
-        base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        model: str = "qwen3.5-flash",
+        base_url: str = "https://aihubmix.com/v1",
+        model: str = "gpt-4o-mini",
         timeout: float = 8.0,
         max_retries: int = 1,
         client: httpx.AsyncClient | None = None,
@@ -500,7 +516,7 @@ class DashScopeExtractor:
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
         }
-        if "qwen" in self.model.lower() or "dashscope" in self.base_url.lower():
+        if "api.openai.com" not in self.base_url.lower():
             payload["enable_thinking"] = False
 
         for _ in range(self.max_retries + 1):
@@ -574,7 +590,7 @@ class DashScopeExtractor:
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
         }
-        if "qwen" in self.model.lower() or "dashscope" in self.base_url.lower():
+        if "api.openai.com" not in self.base_url.lower():
             payload["enable_thinking"] = False
         client = self._get_client()
         try:
@@ -608,7 +624,7 @@ class DashScopeExtractor:
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
         }
-        if "qwen" in self.model.lower() or "dashscope" in self.base_url.lower():
+        if "api.openai.com" not in self.base_url.lower():
             payload["enable_thinking"] = False
         client = self._get_client()
         try:
@@ -639,11 +655,17 @@ def _normalize_subject_and_tier(
     raw_key: str,
     is_fiction: bool | None = None,
     fact_text: str = "",
+    user_self_names: set[str] | None = None,
 ) -> tuple[str, bool, str, str]:
     subj = raw_subject.strip() or "user"
     subj_lower = subj.casefold()
     tier = raw_tier.strip()
     key = raw_key.strip()
+
+    if user_self_names and subj_lower in {n.casefold() for n in user_self_names}:
+        is_draft = (is_fiction is True) or (tier == "user_draft_fiction")
+        sub_tier = "user_draft_fiction" if is_draft else "user_direct"
+        return "user", False, sub_tier, key or "常规/事实"
 
     is_fictional = (
         (is_fiction is True)
@@ -693,6 +715,8 @@ def sanitize_extraction_result(
     batch_messages: Sequence[dict[str, Any]],
 ) -> tuple[list[ExtractedFact], list[ExtractedForgetAction]]:
     """Validate LLM extraction dict item-by-item; merge regex fallback if schema is broken."""
+    user_self_names = infer_user_self_names(batch_messages)
+    user_self_names_cf = {n.casefold() for n in user_self_names}
     writable_msgs = [m for m in batch_messages if not m.get("read_only")]
     regex_fallback = regex_extract_batch(writable_msgs)
     if not isinstance(raw, dict):
@@ -786,6 +810,33 @@ def sanitize_extraction_result(
         if f_key not in seen_forget_keys:
             seen_forget_keys.add(f_key)
             forgets.append(fa)
+
+    def _is_valid_pos_seq(s: Any) -> bool:
+        if isinstance(s, bool) or not isinstance(s, int | str):
+            return False
+        s_str = str(s).strip()
+        if not s_str.isdigit():
+            return False
+        val = int(s_str)
+        return val > 0 and val in writable_seqs
+
+    explicit_forget_seqs: set[int] = set()
+    explicit_forget_kws_by_seq: dict[int, list[str]] = {}
+    if isinstance(raw_forgets, list):
+        for rf_item in raw_forgets:
+            if isinstance(rf_item, dict) and _is_valid_pos_seq(rf_item.get("trigger_seq")):
+                trig = int(str(rf_item["trigger_seq"]).strip())
+                msg_text = seq_to_content.get(trig, "").strip()
+                if bool(msg_text) and has_explicit_forget_keyword(msg_text):
+                    explicit_forget_seqs.add(trig)
+                    raw_kws = rf_item.get("target_keywords")
+                    if isinstance(raw_kws, list):
+                        explicit_forget_kws_by_seq.setdefault(trig, []).extend(
+                            str(k).strip() for k in raw_kws if str(k).strip()
+                        )
+                    desc = rf_item.get("target_description")
+                    if desc and isinstance(desc, str):
+                        explicit_forget_kws_by_seq.setdefault(trig, []).append(desc.strip())
 
     def _parse_canonical_items(items: Sequence[Any], *, mark_broken: bool) -> None:
         nonlocal schema_broken
@@ -885,8 +936,42 @@ def sanitize_extraction_result(
                 seqs = [default_seq]
 
             if (
+                op_type != "delete"
+                and has_single_explicit_seq
+                and seqs[0] in explicit_forget_seqs
+            ):
+                cand_kws = explicit_forget_kws_by_seq.get(seqs[0], [])
+                val_lower = f"{val} {fact_text}".casefold()
+                is_retraction = any(
+                    phrase in val_lower
+                    for phrase in (
+                        "prefers not to",
+                        "prefer not to",
+                        "no longer",
+                        "do not",
+                        "don't",
+                        "does not",
+                        "doesn't",
+                        "不再",
+                        "不要",
+                        "别再",
+                        "不会再",
+                        "不是",
+                    )
+                )
+                kw_overlap = sum(
+                    1
+                    for kw in cand_kws
+                    if kw.casefold() in val_lower
+                    or any(p in val_lower for p in kw.casefold().split() if len(p) >= 3)
+                )
+                if is_retraction or kw_overlap >= 2:
+                    continue
+
+            if (
                 has_single_explicit_seq
                 and op_type != "delete"
+                and seqs[0] not in explicit_forget_seqs
                 and ("who" in item or "is_fiction" in item)
                 and "op" not in item
             ):
@@ -997,6 +1082,7 @@ def sanitize_extraction_result(
                 raw_key,
                 is_fiction=is_fiction,
                 fact_text=fact_text,
+                user_self_names=user_self_names,
             )
             if not val:
                 val = fact_text
@@ -1007,6 +1093,9 @@ def sanitize_extraction_result(
             style_note = str(item.get("style_note") or "").strip()
             ev_start = item.get("event_date_start") or item.get("date")
             ev_end = item.get("event_date_end") or item.get("date")
+            raw_implied = str(item.get("implied") or "").strip()
+            if raw_implied.lower() in _PLACEHOLDER_STRINGS:
+                raw_implied = ""
             is_v24_fact = bool(
                 ("who" in item or "is_fiction" in item)
                 and ("op" not in item)
@@ -1032,21 +1121,13 @@ def sanitize_extraction_result(
                     aliases=aliases,
                     relations=relations,
                     is_v24=is_v24_fact,
+                    implied=raw_implied,
                 )
             )
 
     for top_list in (raw_ops, raw_tag_updates, raw_facts):
         if isinstance(top_list, list):
             _parse_canonical_items(top_list, mark_broken=True)
-
-    def _is_valid_pos_seq(s: Any) -> bool:
-        if isinstance(s, bool) or not isinstance(s, int | str):
-            return False
-        s_str = str(s).strip()
-        if not s_str.isdigit():
-            return False
-        val = int(s_str)
-        return val > 0 and val in writable_seqs
 
     if isinstance(raw_forgets, list):
         for item in raw_forgets:
@@ -1173,4 +1254,61 @@ def sanitize_extraction_result(
                 )
             )
 
+    if user_self_names_cf:
+        for f in facts:
+            if f.subject.casefold() in user_self_names_cf:
+                f.subject = "user"
+                f.is_other_person = False
+                f.source_tier = (
+                    "user_draft_fiction"
+                    if f.source_tier == "user_draft_fiction"
+                    else "user_direct"
+                )
+
     return facts, forgets
+
+
+def _parse_v24_payload(raw_item: dict[str, Any] | list[Any]) -> ExtractedFact | list[ExtractedFact]:
+    if isinstance(raw_item, list):
+        facts_list: list[ExtractedFact] = []
+        for it in raw_item:
+            res = _parse_v24_payload(it)
+            if isinstance(res, list):
+                facts_list.extend(res)
+            elif isinstance(res, ExtractedFact):
+                facts_list.append(res)
+        return facts_list
+
+    if not isinstance(raw_item, dict):
+        return ExtractedFact(source_seqs=[1])
+
+    if "facts" in raw_item and isinstance(raw_item["facts"], list):
+        msgs = []
+        for it in raw_item["facts"]:
+            if isinstance(it, dict):
+                s = int(it.get("seq") or 1)
+                c = str(it.get("fact") or it.get("value") or "msg")
+                msgs.append({"seq": s, "role": "user", "content": c})
+        if not msgs:
+            msgs = [{"seq": 1, "role": "user", "content": "msg"}]
+        facts, _ = sanitize_extraction_result(raw_item, msgs)
+        return facts
+
+    s = int(raw_item.get("seq") or 1)
+    c = str(raw_item.get("fact") or raw_item.get("value") or "msg")
+    msgs = [{"seq": s, "role": "user", "content": c}]
+    facts, _ = sanitize_extraction_result({"facts": [raw_item]}, msgs)
+    if facts:
+        return facts[0]
+    return ExtractedFact(
+        source_seqs=[s],
+        subject=str(raw_item.get("subject") or raw_item.get("who") or "user"),
+        tag=str(raw_item.get("tag") or raw_item.get("key") or "常规/事实"),
+        fact_text=str(raw_item.get("fact") or raw_item.get("fact_text") or c),
+        current_state=str(raw_item.get("current_state") or raw_item.get("value") or c),
+        implied=str(raw_item.get("implied") or "").strip(),
+    )
+
+
+DashScopeExtractor._parse_v24_payload = staticmethod(_parse_v24_payload)
+

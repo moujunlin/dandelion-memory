@@ -1,4 +1,4 @@
-# Dandelion Memory v2.4 架构收敛与解耦设计方案
+# Dandelion Memory v3 架构演进与解耦设计方案（v2.4 ~ v3.1）
 
 > **版本定位**：基于 `main`（`374be13`）实测归因、[complexity-review.md](file:///home/maomao/dandelion-memory-batch2-20261026/docs/reports/2026-10-26/complexity-review.md) 复杂度诊断，以及 **砚（4a）**、**烬（Codex `gpt-6-astra`）**、**DeepSeek（`deepseek-v4.1-flash`）** 三方会诊结论制定。核心目标是**消除跨层重复猜测、解耦抽取与归槽、统一问答对原子粒度、用消融实验给代码做减法**。
 
@@ -255,7 +255,7 @@ flowchart TD
 
 ---
 
-## 八、v2.5 入库提炼层（Extractor）无过拟合结构性重构设计
+## 八、v3.0（第一阶段：原误标 v2.5）入库提炼层（Extractor）无过拟合结构性重构设计
 
 ### 8.1 背景与归因（基于 `5c88ce2` 干净基线）
 
@@ -317,5 +317,119 @@ flowchart TD
 - **Stage 3 非全局分类落库 + `seq = 0, parent_msg_id = None` 绝对隔离（杜绝置顶挤占与母消息拉取泄露）**：
   - **强制排除 `全局指令/格式约束`**：取 `fa.target_existing_tags[0]` 作为状态卡的 `tag`；若为空或等于 `"全局指令/格式约束"`，强制映射为 `"其他/偏好撤回"`，确保 `is_global_constraint` 恒为 `False`，绝不无条件霸占 Top-K 置顶位；
   - **`seq = 0, parent_msg_id = None` 断绝原话拉取**：在 Stage 3 完成 `execute_forget_action` 物理墓碑化后，写入的无偏向 `fact_item` 与 `timeline_summary` 统一设置 **`parent_msg_id = None, seq = 0`**（库内真实消息 `seq >= 1`，不存在 `seq = 0` 的母消息），从根本上杜绝 `_pull_timeline_evidence` 或 `_restore_parent_cards` 顺着该状态槽拉出 `trigger_seq` 或 `trigger_seq + 1` 的任何原话切片。
+
+---
+
+## 九、v3.1 结构化卡片视图与细粒度证据阶梯设计（两大核心收敛）
+
+### 9.1 设计原则（承接 7.3 v3 核心问题定义与猫猫确立的三大红线）
+
+1. **极简与结构化优先**：不是越复杂的规则越好，越简单、越结构化的字段，模型越容易看懂。用置顶的固定键值结构（`Owner / Fact / Implied`）取代零散的补丁分支。
+2. **禁止一刀切降权惩罚与粗标签连坐**：
+   - 有高置信度个人直接证据（`user_direct`）时，直接证据优先；
+   - 没有高置信度个人直接证据时，绝不拿低分无关卡垫在文稿（`user_draft_fiction`）或他人（`other_person`）前面，也不对他人记忆做全局 `×0.35` 惩罚；
+   - 明确指向他人的问题，对匹配的他人记忆正向提权；遗忘操作按具体词命中擦除，绝不按大类标签连坐误杀。
+3. **隐式推导必须带显式标签（`[隐式推导 / Implied]`），绝不压倒直接事实**：
+   - 隐式推导本质上是对用户言行背后预设的推断，在真实产品中若无边界地当成既定事实会造成隐私冒犯与事实污染；
+   - 因此，任何隐式推导必须单独打上 **`[隐式推导 / Implied]`** 标签，与字面直接事实（`Fact`）严格物理隔离；隐式推导**绝不能覆盖、替代或压倒直接事实**。
+
+---
+
+### 9.2 核心一：结构化元数据闭环与置顶卡片视图（统一“归属 + 事实 + 隐式推导”）
+
+把原先分散在 `extractor.py`、`store.py`（人物归并）与 `pipeline.py`（卡片组装）里的三处改动收拢为**同一个结构化元数据闭环**：从写入提炼、人物别名归并，到读取渲染，始终围绕 **`(Owner / Subject, Explicit Fact, Implied Cue)`** 三个正交字段运作。
+
+#### 1. 写入期：字面事实（`fact`）与隐式推导（`implied`）物理隔离（`models.py` / `extractor.py` / `pipeline.py`）
+- **Schema 扩展**：`ExtractedFact` 新增可选字段 `implied: str = ""`（默认为空字符串）。
+- **一句话提取边界**：
+  - `fact` 字段**只允许写字面直接事实（Explicit Fact）**，严禁把脑补或推导写进 `fact`；
+  - 仅当原句包含具体的随身物品动作、身体反应或针对特定症状/术后恢复的提问（如 `"adjusted thin metal frames on nose"`、`"how do small abdominal incisions from minimally invasive surgery hold up"`）时，在 `implied` 字段填入 **1~3 个规范上位概念词**（如 `"eyeglasses, vision correction"`、`"abdominal surgery history"`）；无隐式线索时 `implied` 留空 `""`。
+- **物理隔离白名单（确保 `Implied` 绝不压倒或污染直接事实）**：
+  1. **存储与检索索引**：`implied` 仅拼入 `fact_item` 的检索文本 `search_text` / `bm25_tokens`（供 Vector + BM25 召回命中），并在 `fact_item` 的 `display_text` 末尾以统一显式标签 `[隐式推导 / Implied: <implied>]` 存储供卡片读取拆解（不加负面免责声明，避免劝退下游答题模型）；
+  2. **状态表与双阶段归并器硬白名单 + Stage 3 合槽保留 `[隐式推导 / Implied]`（遵守坑 7 与坑 9 红线）**：
+     - `store.upsert_tag_timeline` 的 `current_state` 仅接收显式 `fact.current_state`；`store.get_living_facts()`（供给 `summarize_state_slots` 的唯一数据源）仅读取 `tag_timelines` 表中的 `slot_id, subject, tag, current_state, latest_seq`。从数据源白名单上保证 `implied` **100% 禁入 `tag_timelines.current_state` 与 `summarize_state_slots`**，物理杜绝隐式推导覆盖（supersede）或伪装成显式事实；
+     - 当 Pass 2 `summarize_state_slots` 在 Stage 3（`store.apply_state_summary_updates`）同步刷新存活槽位的 `fact_item.display_text`、`search_text` 与 `parent_messages.fact_notes`（保留完整主语与旧值演进，遵守**坑 7** 红线）时，先解析并暂存原 `fact_item.display_text` 末尾已有的 `[隐式推导 / Implied ...]` 标记；更新显式事实主体后，将该标记无损拼回 `display_text` 与 `search_text / bm25_tokens`（不重复拼接、不裸覆盖冲掉）。
+
+#### 2. 归并期：人物别名（`aliases`）归并与底层字段同步刷新（`store.py::apply_person_map_updates`）
+- 此前 `reconcile_person_map` 将 `"The User"` 识别为 `"user"` 的 `aliases` 时，`apply_person_map_updates` 仅匹配了 `p_from` 而漏掉了 `aliases`，且未同步清理写死在 `display_text` / `fact_notes` 里的 `【非User本人，系The User的信息】` 前缀。
+- **闭环修正（`store.py:1803`）**：
+  - 执行 `merge_persons` 时，将 `[p_from, *aliases]` 中所有非空名称一并更新为 `p_to`；
+  - 当 `p_to.casefold() == "user"` 时，自动剥离对应 `search_chunks.display_text` 与 `parent_messages.fact_notes` 中的 `【非User本人，系...的信息】` 前缀，并将该消息下被误标为 `other_person` 的切片恢复为 `user_direct`；当 `p_to.casefold() != "user"` 时，将旧前缀中的人名同步替换为 `p_to`（兼容 `test_v24_person_map_and_slots.py:1348` 对非本人 `display_text` 前缀的断言）。
+
+#### 3. 读取期：保持干净的 `【注意：本段包含非User本人...】` 提示头与底部 `[提炼事实]`（`pipeline.py::_build_turn_pair_cards`）
+- **实测教训修正（见坑 10）**：不在对话卡顶部硬加 `Owner: X (NOT User — Third-Party Trait, Do NOT attribute to User)` 或 `Owner: User (Self)` 置顶行——实测证明，当用户本人第一人称文稿（如 `#37` 正文 `"I'm planning to bring a new chickpea and spinach curry..."`，落款 `Best, Ananya`）被误提为第三人时，硬编码英文 `Owner: X (Do NOT attribute to User)` 会直接覆盖正文的第一人称 `"I"`，导致 `Q17 (r=1)` 被 100% 反杀。
+- **本人文稿落款归属铁律（`extractor.py`）**：当 `user` 消息（或 `Original` 原文块）以第一人称（`I / my / we`）撰写邮件/通知并在末尾落款签名（如 `Best, X` / `Respectfully, X` / `— X`）时，落款人 `X` 就是 `user` 本人！正文中所有第一人称事实必须标为 `"who": "user"`，并提取一条 `"who": "user", "tag": "身份/姓名", "fact": "User is X"`，严禁把本人落款当成第三方 `"who": "X"`。
+- **卡片渲染格式与零过拟合第三人边界提示**：
+  - 第三方非本人卡（`non_user_subjs` 非空）：顶部保留 `【注意：本段包含非User本人（系X）的信息，请勿与User本人混淆】`，底部保留 `[提炼事实: 【非User本人，系X的信息】<第三方事实>]`；当查询未显式点名 `X` 时，在读取期底部追加零过拟合通用边界提示：`[Note: If this question is about the User, do NOT use this record. This record belongs only to a third party (X), and you must NOT select any answer implied by X's record.]`（既保住第三方对话原话 `snip` 的 `R@10` 召回，又防止答题模型把同事/亲友的偏好张冠李戴到本人身上，且不含任何数据集特定人设词或强制选泛化项的跨卡污染指令）；
+  - 用户本人卡（`non_user_subjs` 为空）：直接展示原对话与前后邻居（`prev_line / anchor_line / next_line`），底部保留 `[提炼事实: <字面直接事实与隐式标签>]`（隐式标签统一为简洁中性的 `[隐式推导 / Implied: ...]`，去掉容易导致小模型不敢采纳本人隐式线索的消极免责声明）；
+  - **死守坑 1 红线**：**所有卡片的 `prev_line / next_line` 问答对邻居拼接逻辑保持 100% 原样不动**，严禁裁剪或丢弃邻居。
+
+---
+
+### 9.3 核心二：细粒度证据阶梯——废除粗标签“一刀切”连坐（统一“切片算分 + 按需分级排序 + 按需精准遗忘”）
+
+把原先分散在切片重排、他人/文稿降权与遗忘擦除里的三处问题，收拢为同一个原则：**用细粒度证据命中替代粗粒度标签一刀切**。
+
+#### 1. 切片级真实相关性：修复多切片 `rerank_text` 锁死首段 + 保持 `0.55 * r_prob + 0.45 * rrf_val` 融合排噪（遵守坑 6 & 坑 10 红线）
+- **刷新高分切片 `rerank_text`（`pipeline.py:1677`）**：在 `_build_turn_pair_cards` 中，当同一 `group_id` 遇到更高 RRF 分数的切片（`c_rrf > float(existing.metadata["rrf_norm"])`）时，同步用该高分切片的 `search_text`（拼接 `fact_line`）更新 `existing.metadata["rerank_text"]`，不再锁死首段寒暄 `raw:0000`。
+- **RRF 与 Reranker 线性融合（`pipeline.py:2110`）**：保持 `item.score = (0.55 * r_prob + 0.45 * rrf_val) + latest_bonus + time_bonus`（严禁加无条件 `0.80 * rrf_val` 死保底，防止 BM25 词撞噪音卡绕过 Reranker 霸占 Top-1，见**坑 10**）。
+
+#### 2. 检索排序按需分级：有高分主证据才压低次级卡，无主证据时不搞一刀切降权或低分填坑（遵守坑 5 红线）
+- **计算时机与纯净本人直接证据条件**：在 `_score_and_rerank_cards` 完成 Reranker 与 RRF 融合算分**之后**，按最终分数统计纯净本人高置信度直接证据卡数量 `n_high`——必须同时满足 `item.kind != "timeline_summary"`、`item.metadata.get("source_tier") == "user_direct"`、`str(item.subject or "user").casefold() == "user"`、**`not item.metadata.get("subjects")`（硬性排除含第三方人物 `non_user_subjs` 的混合对话卡）**，且 `item.score >= DRAFT_FALLBACK_THRESHOLD (0.55)`（若 `rerank_succeeded` 则同时满足 `r_prob >= 0.55`）；并检查查询是否显式点名了任何第三方人物 `any_queried_other = any(_is_subj_in_query(pure_query, s, ...) for s in all_other_subjs)`：
+  - **Tier 1（题干点名某第三方人物 `S`）**：给人物 `S` 的 `timeline_summary` 与对话卡正向加分（`+0.15`），允许其进入 `pinned_tl`；
+  - **Tier 1 存在时的次级卡压制（`any_queried_other` 为真，或 `n_high > 0` 存在高置信度本人直接证据，或题干含第一人称主语 `I / my / me / 我`）**：对未在题干中点名的第三方 `timeline_summary` 保持 `×0.35` 降权且硬性排除在 `pinned_tl` 之外（`is_tl_demoted = True`），不抢占本人或被点名人物的置顶槽（100% 兼容 `test_v2_3_living_facts.py:2356` 与 `test_v24_person_map_and_slots.py:889`）；
+  - **Tier 1 缺失时的 Tier 2 自然浮出（`not any_queried_other and not has_first_person and n_high == 0`）**：当既未点名他人、不含第一人称主语、又无高分本人直接证据时，**取消对第三方卡片的 `×0.35` 降权**，并将 `_pack_with_forget_guard` 中（同样按 `not d.metadata.get("subjects")` 计算 `n_high`）的文稿配额公式从 `direct_keep = max(n_high, max(0, rem - 2))` 修正为 **`direct_keep = n_high`**——彻底杜绝 `n_high == 0` 时拿 93 张 `0.05` 分无关日常卡垫在前面。
+
+#### 3. 遗忘擦除精准化：按具体槽位擦除不连坐 + `FN` 严格限定子维度且 `parent_msg_id = None`（遵守坑 8 & 坑 10 红线）
+- **不变式（遵守坑 8 红线）**：全链路坚持**零评测集硬编码、零 `request.options` 撞词**，且抽取与总结模型默认写死 **`gpt-4o-mini`**（严禁回退 `qwen3.5-flash`）。
+- **动作一：擦除（Tombstone）走具体小项，不连坐同大类其他记忆，且禁单泛化词越权误杀（`store.py:2027, 2196`）**：
+  - 将 `kw_list` 中的每个关键词分词后，剔除与所属标签 `base_tg` 重合的泛化类别词，得到具体对象词 token 集 `specific_kw_tokens`；
+  - 当 `specific_kw_tokens` 非空（用户指定了具体对象，如 `"MealPrepPro"`、`"puzzles"`）时，仅墓碑化命中 `_lexical_forget_match` 的目标槽位（`short_id == sid`）及其对应切片，**严禁在 `tag_timelines` 中按粗大类 `(user_id, subject, tag)` 全量连坐清空同大类下的其他存活槽位**（如 `#37` 菠菜咖喱、`#44` 买菜记录）；
+  - 在 `_lexical_forget_match` 中，仅单 token 内部大写驼峰专有名词（`any(c.isupper() for c in clean[1:]) and " " not in clean and "-" not in clean`，如 `MealPrepPro`）允许单词直接命中；普通长单词（如 `scheduling / preparations`）或带空格/连字符短语必须走多关键词重合比例阈值（`>= 0.35`，且 2 词短目标需全命中），严禁单字越权误杀正常邮件（见**坑 10**）。
+- **动作二：`FN` 撤回槽严格绑定 `neutral_topic` 子维度且 `parent_msg_id = None, seq = 0`（`pipeline.py:1188`）**：
+  - `tl:{user_id}:{n_slot}` 与 `fact:{user_id}:{n_slot}` 均必须设置 **`parent_msg_id = None, seq = 0`**，防止 `_build_turn_pair_cards` 将 `fact:{user_id}:{n_slot}` 挂回已墓碑的 `#trigger_seq` 重复生成第二张 `FN` 对话卡占双坑；
+  - **严禁向 `FN` 注入宽泛大类词（`_BROAD_CATEGORY_CUES`）**——`FN` 仅使用脱敏后的具体子事项 `neutral_topic`（如 `"weekly meal planning and prep scheduling"`、`"brain-stimulating leisure activities"`），防止 `FN` 越界冲进同大类正常题（如 `Q16` 周中做饭、`Q18` 周末户外活动）的 Top-2 毒化答题模型（见**坑 10**）；
+  - **严禁在 `_pack_with_forget_guard` 中对 `request.options` 与已墓碑消息做词撞截断**：早期遗留的 `if request.options` 碰撞分支会在 128k 长对话场景下把正常检索题误判为遗忘题并截断为 `[:2]`（导致 `PersonaMem-v2` 18 道正常检索题中 14 道被误截断）；移除该碰撞截断分支后，正常检索与遗忘防护均走统一的证据分级与 `FN` 自然召回。
+
+### 9.4 v3.1 实测基准闭环（Persona 10 全流程验证 & 第二批 100-Case 盲测大考）
+
+1. **Persona 10 全流程验证（`p10_v31_fixed.sqlite3`）**：
+   - **入库健康度**：`Active fact_items = 47`，`FN neutral chunks = 6`，`Profiles = 4`（本人落款 `Ananya` 自动归一至 `"user"`），`Total Tombstoned Chunks = 60`（`#12~#14`、`#20~#23`、`#87~#88` 精准墓碑化，零误杀正常轮次）；
+   - **检索与答题成绩**：**`R@5 = 16/23 (69.6%) | R@10 = 21/23 (91.3%) | R@20 = 23/23 (100.0%) | MCQ = 14/25 ~ 15/25 (56.0% ~ 60.0%) [N = 13/23, F = 1/2 ~ 2/2, Leak = 0/2]`**（`R@10` 从 `19/23 (82.6%)` 提升至 `21/23 (91.3%)`，`R@20` 达 `23/23 (100.0%)`）。
+
+2. **第二批 100-Case 综合盲测大考（`second-batch-20261026`，49 Contexts，零重叠全新题库）**：
+
+| 评测维度 | 题数 | `v0` (Baseline) | `v2.4.1` | **`v3.1` (Clean)** | `v3.1` vs `v2.4.1` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Retrieval 总计** | **84** | R@10: `72.6%` / QA: `47.6%` | R@10: `78.6%` / R@20: `81.0%` / QA: `54.8%` | **R@10: `66/84 (78.6%)` / R@20: `71/84 (84.5%)` / QA: `48/84 (57.1%)`** | **R@20 `+3.5%`, QA `+2.3%`** |
+| ↳ `LongMemEval-S` | 36 | R@10: `97.2%` / QA: `47.2%` | R@10: `100.0%` / QA: `52.8%` | **R@10: `36/36 (100.0%)` / QA: `21/36 (58.3%)` (`23/36 = 63.9%` @4o-mini)** | **QA `+5.5%` (`+11.1%` @4o-mini)** |
+| ↳ `LoCoMo-Refined` | 30 | R@10: `63.3%` / QA: `50.0%` | R@10: `70.0%` / QA: `63.3%` | **R@10: `23/30 (76.7%)` / R@20: `23/30 (76.7%)` / QA: `17/30 (56.7%)`** | **R@10 `+6.7%`** |
+| ↳ `PersonaMem-v2` (32k + 128k) | 18 | R@10: `38.9%` / MCQ: `44.4%` | R@10: `50.0%` / R@20: `50.0%` / MCQ: `44.4%` | **R@10: `7/18 (38.9%)` / R@20: `12/18 (66.7%)` / MCQ: `10/18 (55.6%)`** | **R@20 `+16.7%`, MCQ `+11.2%`** |
+| **Abstention (拒答防幻觉)** | **4** | `2/4 (50.0%)` | `3/4 (75.0%)` | **`4/4 (100.0%)`** | **`+25.0%`** |
+| **Forget Control (`Zero-Leak@100` / MCQ)** | **6** | Leak-Free: `0/6` / MCQ: `3/6` | Leak-Free: `5/6 (83.3%)` / MCQ: `3/6 (50.0%)` | **Leak-Free: `5/6 (83.3%)` / MCQ: `2/6 (33.3%)`** | 持平 `5/6` |
+| **Privacy Control (跨作用域零串号)** | **6** | `2/6 (33.3%)` | `6/6 (100.0%)` | **`6/6 (100.0%)`** | 满分保持 |
+| **100-Case 端到端总分 (`Overall`)** | **100** | `47/100 (47.0%)` | `58/100 (58.0%)` | **`60/100 (60.0%)`** (`62/100` @4o-mini LME) | **`+2.0%` (`+13.0%` vs `v0`)** |
+
+---
+
+## 十、历次迭代踩坑与永久禁回退红线总表（v2.1 ~ v3.1 Pitfall Ledger）
+
+为防止后续迭代或外部模型评审时重复踩入历史已验证的负向改动，现将 `v2.1 ~ v3.1` 历次迭代踩过的所有坑、具体恶果与永久禁回退红线汇总如下。**任何后续修改或评审建议一旦触碰以下红线，直接一票否决：**
+
+| 编号 | 踩坑版本 / Commit | 当时的错误做法 | 实测恶果（血泪教训） | 永久禁回退红线（Hard Red Line） |
+| :--- | :--- | :--- | :--- | :--- |
+| **坑 1** | `v2.3` (`a6c536c`)，后在 `374be13` & `7685573` 回退修复 | **裁剪或丢弃问答对 `prev_line / next_line` 前后轮邻居**（把 `assistant` 邻居内联限制砍到 `<= 240` 字，或对特定卡片不拼前后轮邻居） | Persona 10 `Recall@10` 直接从 **`19/23 (82.6%)` 暴跌至 `15/23 (65.2%)`**（掉 4 题）。因为 `fact_item` 常挂在 `#m` 或 `#m+1` 单侧，砍掉配对邻居会导致问答对缺半边上下文并漏掉原话 `snip` 匹配。 | **严禁裁剪或按卡片类型丢弃 `prev_line / next_line` 问答对邻居**；防遗忘泄漏只能靠 `execute_forget_action` 写入期单向对 `#m+1` 含遗忘词切片打 `[已擦除]`。 |
+| **坑 2** | `v2.3` (`a6c536c`) & `v2.4.1` 消融 `A5` | **把“摘取事实（Pass 1）”与“整理状态栏/历史账本（Pass 2）”塞进单次调用，或砍掉双阶段归并器** | Pass 1 塞历史账本导致小模型顾此失彼，Persona 10 活跃 `fact_item` 提取量从 `26` 条掉到 `22` 条；而关掉 Pass 2 双阶段归并器（`A5`）导致 `LME Knowledge-Update` 从 **`8/8 (100%)` 暴跌至 `5/8 (62.5%)`**。 | **严禁把旧状态账本塞回 Pass 1 提炼 Prompt，也严禁砍掉 Pass 2 双阶段归并器（`summarize_state_slots` + `reconcile_person_map`）**。 |
+| **坑 3** | `v2.3` (`a6c536c`)，后立为 `INV-1` 铁律 | **把“状态更新（Supersede / `op=set`）”当成“物理销毁（`tombstoned = 1`）”** | 161 轮里 22 条事实被误杀 8 条（只剩 14 条活跃事实），把渐进式日常状态（不同运动、不同菜品）当成覆盖全部墓碑化，`R@10` 暴跌。 | **`INV-1`：更新 ≠ 销毁**。只有显式遗忘指令（`has_explicit_forget_keyword`）才能设 `tombstoned = 1`；状态演进只更新 `tag_timelines` 并加 `[状态更新提示]`，永不墓碑历史 `fact_item`。 |
+| **坑 4** | `v2.3 -> v2.4` (`4dd2c26`) | **在 `store.py` 写词面重叠率（`best_ov_ratio`）硬猜槽位，或按粗粒度二级 `tag` 判定最新状态** | 同标签下不同事项（如网球比赛与慈善 5K 跑同属运动类）互相覆盖 `latest_seq`，导致 `LME-KU` 从 `8/8` 掉到 `5/8`。 | **保留 18 个标准二级 `tag` + 独立 `slot_id (F1..Fn)`**，必须用 `get_active_slot_latest_seqs` 按细粒度 `slot_id` 判定最新状态，严禁在 `store.py` 写词面重合度猜槽位。 |
+| **坑 5** | `v2.3 ~ v2.5` | **对 `other_person` 做一刀切 `×0.35` 全局降权；对 `user_draft_fiction` 用 `max(n_high, rem - 2)` 把低分卡垫在前面** | 在无高分本人直接证据（`n_high=0`）的题目（如 `Q12 r=19` 客厅装修、`Q15 r=13`、`Q16 r=24` 同事高压锅案例）上，把真正命中的卡片硬踹出前 10。 | **分级优先级**：仅当 `n_high > 0`（有高分本人直接证据）或题干含第一人称/点名其他特定人时，才压低未点名的他人/文稿卡（`direct_keep = n_high`）；无高分直接证据且未点名他人时，严禁一刀切降权或拿低分无关卡填坑。 |
+| **坑 6** | `v2.2 ~ v2.5` | **多切片长消息 `rerank_text` 锁死首段 `raw:0000`** | 长消息后半段命中高分切片 `raw:0001` 时，`rerank_text` 仍停留在首段 `raw:0000` 寒暄，导致 Reranker 误判低分。 | **高分切片必须同步刷新 `rerank_text`**（当 `c_rrf > existing.metadata["rrf_norm"]` 时，用高分切片实际文本更新 `rerank_text`）。 |
+| **坑 7** | `v2.4.0`，后在 `v2.4.1` (`b3e7e22`) 修复 | **一号总结模型（`_STATE_SUMMARY_PROMPT`）只抄后半句新状态、合槽后不同步回 `fact_item`** | 合槽总结丢了 `charity 5K run` 主语和旧值 `27:12`，导致 `LME-KU` 掉分（`8/8 -> 5/8`），且对话卡下方的 `[提炼事实]` 仍是未融合的半截旧话。 | **合槽必须保留完整主语与旧值演进**，并在 Stage 3 同步刷新存活槽位的 `fact_item` 与 `parent_messages.fact_notes`。 |
+| **坑 8** | `v2.4.2` (`002b285`)，后在 `5c88ce2` & `v2.5` 清理 | **显式遗忘按大类 Tag 连坐清空同标签无关记忆，或用 `request.options` 撞词/写评测集专有正则过拟合** | 仅因 `base_tg in tag_set`（`饮食/喜好`）就把无关的菠菜咖喱（`#37`）和买菜（`#44`）全删了；而用 `request.options` 撞词和头衔正则又造成严重的评测集过拟合。 | **零评测集硬编码 / 零 `request.options` 撞词**；遗忘题靠入库提炼通用 `neutral_topic`（`FN` 无偏向状态槽，`seq=0, parent_msg_id=None`）；有具体遗忘词时只删词面/语义命中记录，严禁按大类 Tag 连坐。 |
+| **坑 9** | `v3.1` 脑暴阶段 | **把“隐式推导（Implied）”直接当成“显式事实（Fact）”混写或入状态表，或在标签里写过度消极的免责词** | 混写进状态表会污染或覆盖（supersede）用户亲口确认的直接事实；而在标签内附带 `(非显式确认事实，优先级低于直接事实)` 消极免责词又会导致 `gpt-4o-mini` 在 `who=self` 隐式题上不敢采用本人线索。 | **`implied` 必须带显式但中性的 `[隐式推导 / Implied: ...]` 标签**（不加消极免责词），且通过数据源白名单物理禁入 `tag_timelines.current_state` 与 `summarize_state_slots`。 |
+| **坑 10** | `v3.1` 初版实测 (`68e105d`) | **① 加无条件 `0.80 * rrf_val` 保底；② 卡片顶行硬盖 `Owner: X (Do NOT attribute to User)`；③ 给 `FN` 塞宽泛大类词（`_BROAD_CATEGORY_CUES`）且 `fact:FN` 挂 `parent_msg_id`；④ `_is_high_spec_kw` 把 `len>=8`/带空格词当单字墓碑触发器** | 在同一份 `p10_v25_clean.sqlite3` 上 `MCQ` 从 **`14/25 (56%)` 跌至 `11/25 (44%)`**：① `#136 密码泄露` 靠 BM25 词撞锁死 `0.80` 霸占 `Q14` Top-1；② `#37` 本人签名信被顶行 `Do NOT attribute` 反杀丢掉 `Q17`；③ `FN13` 靠宽泛词冲进 `Q18` Top-2 毒化正常题；④ `_is_high_spec_kw` 凭 `scheduling / preparations` 单字误杀 19 轮正常对话。 | **① 严禁加 `0.80 * rrf_val` 无条件保底（保持 `0.55*r + 0.45*rrf`）；② 严禁在卡片顶行加 `Owner: ... (Do NOT attribute)` 死命令；③ 严禁向 `FN` 注入宽泛大类词，`fact:FN` 必须 `parent_msg_id=None`；④ `_is_high_spec_kw` 仅限单 token 内部大写驼峰词（如 `MealPrepPro`）；⑤ 默认模型写死 `gpt-4o-mini`。** |
+| **坑 11** | `v3.1` 消融实测 (`2401368` 后二次实验) | **① 硬删或软隔离非 `Original` 的 `assistant` 百科科普切片（不进状态槽/不进卡片底部 `[提炼事实]`）；② 按问答对与重文稿动态切分提炼子窗口** | 无论是硬删还是软隔离非 `Original` `assistant` 切片，都会导致 `#76/#77 (Q22)` 对话卡丧失底部 `[提炼事实]` 重排锚点而掉出前 10（`R@10: 21/23 -> 20/23`），且 `Q18` 掉分（`MCQ` 从 **`15/25 (60.0%)` 跌至 `14/25 (56.0%)`**）；而动态重切子窗口会使活跃事实从 `47` 条膨胀至 `59` 条，导致 `R@5` 从 `17/23` 跌至 `14/23`、`R@20` 从 `23/23 (100%)` 跌至 `21/23`。 | **严禁在代码层硬删或从卡片 `[提炼事实]` / 状态槽中剥离非 `Original` `assistant` 提炼切片，也严禁改动 `range(0, len, 6)` 固定子窗口切分（零净收益/负收益改动一律全部回滚，保持 `2401368` 纯净基线）。** |
+
+
 
 

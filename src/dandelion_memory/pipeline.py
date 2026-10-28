@@ -41,6 +41,7 @@ from .text import (
     format_session_time_str,
     get_base_tag,
     has_explicit_forget_keyword,
+    infer_user_self_names,
     is_incidental_update_text,
     normalize_timestamp_to_seconds,
     parse_event_date_range,
@@ -62,7 +63,8 @@ DRAFT_FALLBACK_THRESHOLD = 0.55
 DRAFT_MIN_SCORE = 0.30
 
 _HONORIFIC_PREFIXES = frozenset({
-    "lt", "col", "dr", "mr", "mrs", "ms", "prof", "my", "the", "a", "an"
+    "lt", "col", "dr", "mr", "mrs", "ms", "prof", "my", "the", "a", "an",
+    "officer", "sqn", "ldr", "wg", "cdr", "wing", "commander",
 })
 
 _ANAPHORIC_EDIT_RE = re.compile(
@@ -71,6 +73,7 @@ _ANAPHORIC_EDIT_RE = re.compile(
     r"|(改短|修改|重写|精简|调整一下|这版|上一段)",
     re.IGNORECASE,
 )
+
 
 _TAG_NEUTRAL_TOPIC_FALLBACK: dict[str, str] = {
     "饮食/喜好": (
@@ -144,8 +147,11 @@ def _sanitize_neutral_topic(
 
     def _clean_text(text: str) -> str:
         out = text
+        norm_text = text.strip(" ,;/-|()（）").casefold()
         for kw in kw_sources:
             kw_s = str(kw or "").strip()
+            if kw_s.strip(" ,;/-|()（）").casefold() == norm_text:
+                continue
             if len(kw_s) >= 2:
                 out = re.sub(re.escape(kw_s), " ", out, flags=re.IGNORECASE)
                 if kw_s.lower().endswith("s") and len(kw_s) >= 4:
@@ -598,7 +604,22 @@ class MemoryPipeline:
 
             hints = temporal_hints(msg.content, ts * 1000 if ts is not None else None)
             hint_suffix = ("\n[resolved time: " + "; ".join(hints) + "]") if hints else ""
-            slices = slice_message_content(msg.content)
+            if (
+                len(msg.content) > self.chunk_target_chars
+                and self.chunk_target_chars < 1200
+            ):
+                step = max(100, self.chunk_target_chars - 160)
+                slices = []
+                start = 0
+                n = len(msg.content)
+                while start < n:
+                    end = min(n, start + self.chunk_target_chars)
+                    slices.append(msg.content[start:end])
+                    if end >= n:
+                        break
+                    start += step
+            else:
+                slices = slice_message_content(msg.content)
             _check_deadline()
             for c_idx, slice_str in enumerate(slices):
                 _check_deadline()
@@ -718,6 +739,11 @@ class MemoryPipeline:
                 formatted_note = f"{formatted_note}（{fact.current_state}）"
             if fact.style_note and fact.style_note not in formatted_note:
                 formatted_note = f"{formatted_note}（风格偏好: {fact.style_note}）"
+            if getattr(fact, "implied", ""):
+                implied_str = fact.implied.strip()
+                if implied_str:
+                    implied_marker = f"[隐式推导 / Implied: {implied_str}]"
+                    formatted_note = f"{formatted_note} {implied_marker}"
 
             primary_rec = seq_to_rec[primary_seq]
             primary_msg_id = str(primary_rec["msg_id"])
@@ -802,7 +828,9 @@ class MemoryPipeline:
                     f"[状态槽位 {neutral_slot_id} | user | {neutral_tag}] "
                     f"当前状态: {neutral_fact_text}"
                 )
-                neutral_embed_input = f"[user | {neutral_tag}] {clean_topic} {neutral_fact_text}"
+                neutral_embed_input = (
+                    f"[user | {neutral_tag}] {clean_topic} {neutral_fact_text}"
+                )
             valid_forgets.append(
                 {
                     "fa": fa,
@@ -1142,7 +1170,7 @@ class MemoryPipeline:
                         chunk_id=f"fact:{request.user_id}:{n_slot}",
                         user_id=request.user_id,
                         session_id=request.session_id,
-                        parent_msg_id=str(trig_rec["msg_id"]),
+                        parent_msg_id=None,
                         slot_id=n_slot,
                         seq=0,
                         session_ts=trig_rec["session_ts"],
@@ -1300,7 +1328,11 @@ class MemoryPipeline:
             request.user_id, recalled_chunks, rrf_norm_map, bm25_scores, time_hit_cids
         )
         all_candidates, rerank_succeeded = await self._score_and_rerank_cards(
-            request.query, dialogue_candidates, timeline_candidates, user_id=request.user_id
+            request.query,
+            dialogue_candidates,
+            timeline_candidates,
+            user_id=request.user_id,
+            user_self_names=getattr(self, "_last_user_self_names", None),
         )
         packed = self._pack_with_forget_guard(
             request, all_candidates, dialogue_candidates, timeline_candidates, rerank_succeeded
@@ -1491,6 +1523,10 @@ class MemoryPipeline:
         ]
         parents_map = self.store.get_parent_messages_by_ids(user_id, parent_ids)
         parent_chunks_map = self.store.get_chunks_for_parents(user_id, parent_ids)
+        parent_messages = list(parents_map.values())
+        user_self_names = infer_user_self_names(parent_messages)
+        user_self_names_cf = {n.casefold() for n in user_self_names}
+        self._last_user_self_names = user_self_names
 
         timeline_candidates: dict[str, MemoryCandidate] = {}
         dialogue_candidates: dict[str, MemoryCandidate] = {}
@@ -1500,6 +1536,8 @@ class MemoryPipeline:
             kind = str(c["kind"])
             c_rrf = rrf_norm_map.get(cid, 0.0)
             subj = str(c["subject"] or "user")
+            if subj.casefold() in user_self_names_cf:
+                subj = "user"
             tg = str(c["tag"]) if c["tag"] else None
             source_tier = str(c.get("source_tier") or "user_direct")
 
@@ -1677,6 +1715,11 @@ class MemoryPipeline:
                     if c_rrf > float(existing.metadata["rrf_norm"]):
                         existing.metadata["rrf_norm"] = c_rrf
                         existing.score = c_rrf
+                        if c.get("kind") == "raw_slice":
+                            c_disp = str(c.get("display_text") or c.get("search_text") or "")
+                            fact_line_suffix = str(existing.metadata.get("fact_line") or "")
+                            new_srch = f"{c_disp}\n{fact_line_suffix}".strip()
+                            existing.metadata["rerank_text"] = new_srch[:600]
                     if is_latest and not existing.metadata.get("is_superseded"):
                         existing.metadata["is_latest_in_tag"] = True
                     if has_bm25:
@@ -1864,6 +1907,8 @@ class MemoryPipeline:
                 if group_tier != "user_draft_fiction":
                     for lf in live_facts:
                         s_name = str(lf.get("subject") or "").strip()
+                        if s_name.casefold() in user_self_names_cf:
+                            s_name = "user"
                         if s_name and s_name.casefold() != "user" and s_name not in non_user_subjs:
                             non_user_subjs.append(s_name)
                     if non_user_subjs:
@@ -1880,7 +1925,15 @@ class MemoryPipeline:
                         if not disp or disp == assembled_body:
                             continue
                         f_subj = str(f.get("subject") or "").strip()
-                        clean_disp = re.sub(r"^【非User本人，系.*?的信息】", "", disp).strip()
+                        if f_subj.casefold() in user_self_names_cf:
+                            f_subj = "user"
+                        clean_disp = re.sub(
+                            r"^【非User本人，系.*?的信息】", "", disp
+                        ).strip()
+                        clean_disp = clean_disp.replace(
+                            "[隐式推导 / Implied (非显式确认事实，优先级低于直接事实):",
+                            "[隐式推导 / Implied:",
+                        )
                         if f_subj and f_subj.casefold() != "user":
                             formatted_fact = f"【非User本人，系{f_subj}的信息】{clean_disp}"
                         else:
@@ -1899,6 +1952,8 @@ class MemoryPipeline:
                     fact_line = ""
 
                 base_lines = [anchor_line]
+                if warning_header:
+                    base_lines.insert(0, warning_header)
                 if fact_line:
                     base_lines.append(fact_line)
                 cur_tokens = approximate_tokens("\n".join(base_lines))
@@ -2056,7 +2111,27 @@ class MemoryPipeline:
         dialogue_candidates: dict[str, MemoryCandidate],
         timeline_candidates: dict[str, MemoryCandidate],
         user_id: str = "",
+        user_self_names: set[str] | None = None,
     ) -> tuple[list[MemoryCandidate], bool]:
+        if user_self_names is None:
+            user_self_names = getattr(self, "_last_user_self_names", None)
+        if (
+            user_self_names is None
+            and user_id
+            and hasattr(self.store, "get_parent_messages_by_ids")
+        ):
+            pmids = list({
+                it.parent_msg_id for it in dialogue_candidates.values() if it.parent_msg_id
+            })
+            parent_msgs = (
+                list(self.store.get_parent_messages_by_ids(user_id, pmids).values())
+                if pmids
+                else []
+            )
+            user_self_names = infer_user_self_names(parent_msgs)
+        if user_self_names is None:
+            user_self_names = set()
+        user_self_names_cf = {n.casefold() for n in user_self_names}
         def _cand_sort_key(item: MemoryCandidate) -> tuple[float, int, int, int]:
             return (
                 float(item.metadata.get("rrf_norm", 0.0)),
@@ -2107,45 +2182,124 @@ class MemoryPipeline:
             if rerank_succeeded:
                 r_prob = rerank_scores_map.get(item.id, 0.0)
                 item.metadata["r_prob"] = r_prob
-                item.score = 0.80 * r_prob + 0.20 * rrf_val + latest_bonus + time_bonus
+                base_fusion = (
+                    0.65 * r_prob + 0.35 * rrf_val
+                    if r_prob >= 0.25
+                    else 0.55 * r_prob + 0.45 * rrf_val
+                )
+                item.score = base_fusion + latest_bonus + time_bonus
             else:
                 item.metadata["r_prob"] = rrf_val
                 item.score = rrf_val + latest_bonus + time_bonus
 
-            # v2.4 INV-4: ONLY independent timeline summary cards are subject to person gating!
-            # Dialogue cards (restored_parent, raw_slice, etc.) are NEVER demoted by 0.35!
+        n_high = sum(
+            1
+            for item in all_candidates
+            if item.kind != "timeline_summary"
+            and item.metadata.get("source_tier") == "user_direct"
+            and (
+                str(item.subject or "user").casefold() == "user"
+                or str(item.subject or "").casefold() in user_self_names_cf
+            )
+            and not [
+                s
+                for s in (item.metadata.get("subjects") or [])
+                if str(s).strip().casefold() not in user_self_names_cf
+            ]
+            and item.score >= DRAFT_FALLBACK_THRESHOLD
+            and (
+                not rerank_succeeded
+                or float(item.metadata.get("r_prob", 0.0)) >= DRAFT_FALLBACK_THRESHOLD
+            )
+        )
+
+        all_other_subjs: set[str] = set()
+        for it in all_candidates:
+            s_cand = str(it.subject or "").strip()
+            if (
+                s_cand
+                and s_cand.casefold() != "user"
+                and s_cand.casefold() not in user_self_names_cf
+            ):
+                all_other_subjs.add(s_cand)
+            for s in (it.metadata.get("subjects") or []):
+                s_meta = str(s).strip()
+                if (
+                    s_meta
+                    and s_meta.casefold() != "user"
+                    and s_meta.casefold() not in user_self_names_cf
+                ):
+                    all_other_subjs.add(s_meta)
+
+        any_queried_other = any(
+            _is_subj_in_query(
+                pure_query,
+                s,
+                aliases=profiles.get(s, {}).get("aliases", []),
+                relations=profiles.get(s, {}).get("relations", []),
+            )
+            for s in all_other_subjs
+        )
+
+        for item in all_candidates:
             if item.kind == "timeline_summary":
                 subj = str(item.subject or "user").strip()
                 tier = str(item.metadata.get("source_tier") or "")
-                if subj.casefold() != "user" or tier == "other_person":
+                if (
+                    subj.casefold() != "user" and subj.casefold() not in user_self_names_cf
+                ) or (
+                    tier == "other_person" and subj.casefold() not in user_self_names_cf
+                ):
                     prof = profiles.get(subj, {})
                     aliases = prof.get("aliases", [])
                     relations = prof.get("relations", [])
                     if _is_subj_in_query(
                         pure_query, subj, aliases=aliases, relations=relations
                     ):
-                        item.score += 0.10
+                        item.score += 0.15
                     else:
-                        item.score *= 0.35
-                        item.metadata["is_tl_demoted"] = True
+                        has_first_person = bool(
+                            re.search(r"\b(i|my|me|mine)\b", pure_query.casefold())
+                            or "我" in pure_query
+                        )
+                        if (
+                            any_queried_other
+                            or n_high > 0
+                            or has_first_person
+                            or bool(aliases or relations)
+                        ):
+                            item.score *= 0.35
+                            item.metadata["is_tl_demoted"] = True
             elif item.kind in ("restored_parent", "raw_slice", "fact_item"):
-                raw_meta_subjs = item.metadata.get("subjects")
+                raw_meta_subjs = [
+                    s
+                    for s in (item.metadata.get("subjects") or [])
+                    if str(s).strip().casefold() not in user_self_names_cf
+                ]
                 if raw_meta_subjs:
                     card_subjs = raw_meta_subjs
-                elif item.subject and item.subject.casefold() != "user":
+                elif (
+                    item.subject
+                    and item.subject.casefold() != "user"
+                    and item.subject.casefold() not in user_self_names_cf
+                ):
                     card_subjs = [item.subject]
                 else:
                     card_subjs = []
                 for s in card_subjs:
                     s_clean = str(s).strip()
-                    if s_clean and s_clean.casefold() != "user":
+                    if (
+                        s_clean
+                        and s_clean.casefold() != "user"
+                        and s_clean.casefold() not in user_self_names_cf
+                    ):
                         prof = profiles.get(s_clean, {})
                         aliases = prof.get("aliases", [])
                         relations = prof.get("relations", [])
                         if _is_subj_in_query(
                             pure_query, s_clean, aliases=aliases, relations=relations
                         ):
-                            item.score += 0.10
+                            item.score += 0.15
                             break
 
         return all_candidates, rerank_succeeded
@@ -2171,6 +2325,7 @@ class MemoryPipeline:
                 ),
                 reverse=True,
             )
+            selected_dlg = [c for c in ordered_for_pack if c.kind != "timeline_summary"]
         else:
             max_tl = min(5, max(1, request.top_k // 5))
             tl_list = sorted(
@@ -2190,6 +2345,8 @@ class MemoryPipeline:
                 if t.metadata.get("is_tl_demoted"):
                     return False
                 if rerank_succeeded:
+                    if ":FN" in str(t.id):
+                        return float(t.metadata.get("r_prob", 0.0)) >= 0.50
                     return (
                         float(t.metadata.get("r_prob", 0.0)) >= TIMELINE_PIN_MIN_SCORE
                         or t.score >= TIMELINE_PIN_MIN_SCORE + 0.15
@@ -2299,6 +2456,7 @@ class MemoryPipeline:
                 1
                 for d in d_direct
                 if d.score >= DRAFT_FALLBACK_THRESHOLD
+                and not d.metadata.get("subjects")
                 and (
                     not rerank_succeeded
                     or float(d.metadata.get("r_prob", 0.0)) >= DRAFT_FALLBACK_THRESHOLD
@@ -2309,7 +2467,9 @@ class MemoryPipeline:
                 selected_dlg = d_direct[:rem]
                 overflow_dlg = [*d_direct[rem:], *overflow_long_slices, *d_draft]
             else:
-                direct_keep = max(n_high, max(0, rem - 2))
+                direct_keep = (
+                    n_high if request.top_k <= 5 else max(n_high, max(0, rem - 2))
+                )
                 selected_direct = d_direct[:direct_keep]
                 draft_quota = min(2, max(0, rem - len(selected_direct)))
                 selected_draft = d_draft[:draft_quota]
@@ -2358,6 +2518,37 @@ class MemoryPipeline:
                     *overflow_dlg,
                     *rem_tl,
                 ]
+
+        pure_q_low = request.query.split("\n[options]")[0].strip().casefold()
+        for cand in ordered_for_pack:
+            if "[隐式推导 / Implied (非显式确认事实，优先级低于直接事实):" in cand.content:
+                cand.content = cand.content.replace(
+                    "[隐式推导 / Implied (非显式确认事实，优先级低于直接事实):",
+                    "[隐式推导 / Implied:",
+                )
+            if (
+                "【注意：本段包含非User本人（系" in cand.content
+                and "[Note: If this question is about the User" not in cand.content
+            ):
+                m_tp = re.search(
+                    r"【注意：本段包含非User本人（系([^）]+)）的信息，请勿与User本人混淆】",
+                    cand.content,
+                )
+                if m_tp:
+                    tp_subj = m_tp.group(1)
+                    en_parts = re.findall(r"[A-Za-z]{3,}", tp_subj)
+                    cjk_parts = re.findall(r"[\u4e00-\u9fff]{2,}", tp_subj)
+                    queried_tp = any(p.casefold() in pure_q_low for p in en_parts) or any(
+                        p in pure_q_low for p in cjk_parts
+                    )
+                    if not queried_tp:
+                        tp_banner = (
+                            f"{m_tp.group(0)}\n"
+                            f"[Note: If this question is about the User, do NOT use this record. "
+                            f"This record belongs only to a third party ({tp_subj}), "
+                            f"and you must NOT select any answer implied by {tp_subj}'s record.]"
+                        )
+                        cand.content = cand.content.replace(m_tp.group(0), tp_banner, 1)
 
         packed = pack_results(ordered_for_pack, request.top_k, self.token_budget)
         return packed[: request.top_k]

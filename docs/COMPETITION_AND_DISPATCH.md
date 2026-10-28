@@ -9,7 +9,7 @@
 | 维度 | 线上硬约束 | 系统应对规则 |
 | :--- | :--- | :--- |
 | **接口与延迟** | `/add < 10s`（并发 16..64），`/search < 5s`（并发 16..256，默认 `top_k=5`） | Stage 1 滑窗抽取保持 `Semaphore(4)` 异步并发，禁改串行；Stage 2 单次批量 Embedding；Stage 3 单事务落库。 |
-| **抽取模型 `qwen3.5-flash`** | 1. 字段超 6 个易 JSON 截断或顶层键漂移（`tag_updates`/`facts`）<br>2. 更新已有状态时常漏传 `target_id`<br>3. 跨会话重申同一偏好时重复输出 `op="set"`<br>4. 状态变更（如“卖了旧车”）易幻觉输出 `op="delete"` | 1. Prompt 只留纯 6 字段 `ops`；解析器兼容别名，失败时完整合并 `regex_fallback`<br>2. 漏传 `target_id` 时走同 `subject` 词面重叠退化匹配<br>3. 同值重申幂等，不把旧 `seq` 标为 `superseded`<br>4. 删除动作必过原话 `has_explicit_forget_keyword` 校验，无遗忘词一律转 `op="set"`。 |
+| **抽取与总结模型 `gpt-4o-mini`** | 1. 线上一律固定使用 `gpt-4o-mini`（严禁回退使用 `qwen3.5-flash`）<br>2. 更新已有状态时常漏传 `target_id`<br>3. 跨会话重申同一偏好时重复输出 `op="set"`<br>4. 状态变更（如“卖了旧车”）易幻觉输出 `op="delete"` | 1. `config.py` 与 `extractor.py` 默认模型写死 `gpt-4o-mini`；解析失败时完整合并 `regex_fallback`<br>2. 漏传 `target_id` 时走同 `subject` 词面重叠退化匹配<br>3. 同值重申幂等，不把旧 `seq` 标为 `superseded`<br>4. 删除动作必过原话 `has_explicit_forget_keyword` 校验，无遗忘词一律转 `op="set"`。 |
 | **向量与精排** | `text-embedding-v4` (`1024d`) + `qwen3-rerank` | 送 Rerank 文本限制 `<= 600` 字同质切片，Query 剥离 `options` 选项块。 |
 
 ---
@@ -72,5 +72,5 @@
 
 ### 4.4 烬（Codex `gpt-6-astra` 对抗评审席）
 ```markdown
-请先读 `docs/COMPETITION_AND_DISPATCH.md` 与 `docs/DESIGN.md`，对 `/home/maomao/dandelion-memory` 当前分支做只读对抗性评审（禁改文件）。重点从 7 大数据集的 1-to-N 混合消息、弱模型 `qwen3.5-flash` 劣化输出、乱序/遗忘向量同步及测试未覆盖分支出发，给出分级 Finding（附精确行号）与最小修复建议。谢谢！
+请先读 `docs/COMPETITION_AND_DISPATCH.md` 与 `docs/DESIGN.md`，对 `/home/maomao/dandelion-memory` 当前分支做只读对抗性评审（禁改文件）。重点从 7 大数据集的 1-to-N 混合消息、抽取模型 `gpt-4o-mini` 边界输出、乱序/遗忘向量同步及测试未覆盖分支出发，给出分级 Finding（附精确行号）与最小修复建议。谢谢！
 ```
