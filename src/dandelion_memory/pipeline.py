@@ -742,9 +742,7 @@ class MemoryPipeline:
             if getattr(fact, "implied", ""):
                 implied_str = fact.implied.strip()
                 if implied_str:
-                    implied_marker = (
-                        f"[隐式推导 / Implied (非显式确认事实，优先级低于直接事实): {implied_str}]"
-                    )
+                    implied_marker = f"[隐式推导 / Implied: {implied_str}]"
                     formatted_note = f"{formatted_note} {implied_marker}"
 
             primary_rec = seq_to_rec[primary_seq]
@@ -1932,6 +1930,10 @@ class MemoryPipeline:
                         clean_disp = re.sub(
                             r"^【非User本人，系.*?的信息】", "", disp
                         ).strip()
+                        clean_disp = clean_disp.replace(
+                            "[隐式推导 / Implied (非显式确认事实，优先级低于直接事实):",
+                            "[隐式推导 / Implied:",
+                        )
                         if f_subj and f_subj.casefold() != "user":
                             formatted_fact = f"【非User本人，系{f_subj}的信息】{clean_disp}"
                         else:
@@ -2652,6 +2654,37 @@ class MemoryPipeline:
                     if fn_cand is not None:
                         ordered_for_pack = [fn_cand, *selected_dlg[:2]]
                         break
+
+        pure_q_low = request.query.split("\n[options]")[0].strip().casefold()
+        for cand in ordered_for_pack:
+            if "[隐式推导 / Implied (非显式确认事实，优先级低于直接事实):" in cand.content:
+                cand.content = cand.content.replace(
+                    "[隐式推导 / Implied (非显式确认事实，优先级低于直接事实):",
+                    "[隐式推导 / Implied:",
+                )
+            if (
+                "【注意：本段包含非User本人（系" in cand.content
+                and "[Note: If this question is about the User" not in cand.content
+            ):
+                m_tp = re.search(
+                    r"【注意：本段包含非User本人（系([^）]+)）的信息，请勿与User本人混淆】",
+                    cand.content,
+                )
+                if m_tp:
+                    tp_subj = m_tp.group(1)
+                    en_parts = re.findall(r"[A-Za-z]{3,}", tp_subj)
+                    cjk_parts = re.findall(r"[\u4e00-\u9fff]{2,}", tp_subj)
+                    queried_tp = any(p.casefold() in pure_q_low for p in en_parts) or any(
+                        p in pure_q_low for p in cjk_parts
+                    )
+                    if not queried_tp:
+                        tp_banner = (
+                            f"{m_tp.group(0)}\n"
+                            f"[Note: If this question is about the User, do NOT use this record. "
+                            f"This record belongs only to a third party ({tp_subj}), "
+                            f"and you must NOT select any answer implied by {tp_subj}'s record.]"
+                        )
+                        cand.content = cand.content.replace(m_tp.group(0), tp_banner, 1)
 
         packed = pack_results(ordered_for_pack, request.top_k, self.token_budget)
         return packed[: request.top_k]

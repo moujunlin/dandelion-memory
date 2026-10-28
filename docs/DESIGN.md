@@ -345,7 +345,7 @@ flowchart TD
   - `fact` 字段**只允许写字面直接事实（Explicit Fact）**，严禁把脑补或推导写进 `fact`；
   - 仅当原句包含具体的随身物品动作、身体反应或针对特定症状/术后恢复的提问（如 `"adjusted thin metal frames on nose"`、`"how do small abdominal incisions from minimally invasive surgery hold up"`）时，在 `implied` 字段填入 **1~3 个规范上位概念词**（如 `"eyeglasses, vision correction"`、`"abdominal surgery history"`）；无隐式线索时 `implied` 留空 `""`。
 - **物理隔离白名单（确保 `Implied` 绝不压倒或污染直接事实）**：
-  1. **存储与检索索引**：`implied` 仅拼入 `fact_item` 的检索文本 `search_text` / `bm25_tokens`（供 Vector + BM25 召回命中），并在 `fact_item` 的 `display_text` 末尾以统一显式标签 `[隐式推导 / Implied (非显式确认事实，优先级低于直接事实): <implied>]` 存储供卡片读取拆解；
+  1. **存储与检索索引**：`implied` 仅拼入 `fact_item` 的检索文本 `search_text` / `bm25_tokens`（供 Vector + BM25 召回命中），并在 `fact_item` 的 `display_text` 末尾以统一显式标签 `[隐式推导 / Implied: <implied>]` 存储供卡片读取拆解（不加负面免责声明，避免劝退下游答题模型）；
   2. **状态表与双阶段归并器硬白名单 + Stage 3 合槽保留 `[隐式推导 / Implied]`（遵守坑 7 与坑 9 红线）**：
      - `store.upsert_tag_timeline` 的 `current_state` 仅接收显式 `fact.current_state`；`store.get_living_facts()`（供给 `summarize_state_slots` 的唯一数据源）仅读取 `tag_timelines` 表中的 `slot_id, subject, tag, current_state, latest_seq`。从数据源白名单上保证 `implied` **100% 禁入 `tag_timelines.current_state` 与 `summarize_state_slots`**，物理杜绝隐式推导覆盖（supersede）或伪装成显式事实；
      - 当 Pass 2 `summarize_state_slots` 在 Stage 3（`store.apply_state_summary_updates`）同步刷新存活槽位的 `fact_item.display_text`、`search_text` 与 `parent_messages.fact_notes`（保留完整主语与旧值演进，遵守**坑 7** 红线）时，先解析并暂存原 `fact_item.display_text` 末尾已有的 `[隐式推导 / Implied ...]` 标记；更新显式事实主体后，将该标记无损拼回 `display_text` 与 `search_text / bm25_tokens`（不重复拼接、不裸覆盖冲掉）。
@@ -359,9 +359,9 @@ flowchart TD
 #### 3. 读取期：保持干净的 `【注意：本段包含非User本人...】` 提示头与底部 `[提炼事实]`（`pipeline.py::_build_turn_pair_cards`）
 - **实测教训修正（见坑 10）**：不在对话卡顶部硬加 `Owner: X (NOT User — Third-Party Trait, Do NOT attribute to User)` 或 `Owner: User (Self)` 置顶行——实测证明，当用户本人第一人称文稿（如 `#37` 正文 `"I'm planning to bring a new chickpea and spinach curry..."`，落款 `Best, Ananya`）被误提为第三人时，硬编码英文 `Owner: X (Do NOT attribute to User)` 会直接覆盖正文的第一人称 `"I"`，导致 `Q17 (r=1)` 被 100% 反杀。
 - **本人文稿落款归属铁律（`extractor.py`）**：当 `user` 消息（或 `Original` 原文块）以第一人称（`I / my / we`）撰写邮件/通知并在末尾落款签名（如 `Best, X` / `Respectfully, X` / `— X`）时，落款人 `X` 就是 `user` 本人！正文中所有第一人称事实必须标为 `"who": "user"`，并提取一条 `"who": "user", "tag": "身份/姓名", "fact": "User is X"`，严禁把本人落款当成第三方 `"who": "X"`。
-- **卡片渲染格式**：
-  - 第三方非本人卡（`non_user_subjs` 非空）：顶部保留 `【注意：本段包含非User本人（系X）的信息，请勿与User本人混淆】`，底部保留 `[提炼事实: 【非User本人，系X的信息】<第三方事实>]`；
-  - 用户本人卡（`non_user_subjs` 为空）：直接展示原对话与前后邻居（`prev_line / anchor_line / next_line`），底部保留 `[提炼事实: <字面直接事实与隐式标签>]`；
+- **卡片渲染格式与零过拟合第三人边界提示**：
+  - 第三方非本人卡（`non_user_subjs` 非空）：顶部保留 `【注意：本段包含非User本人（系X）的信息，请勿与User本人混淆】`，底部保留 `[提炼事实: 【非User本人，系X的信息】<第三方事实>]`；当查询未显式点名 `X` 时，在读取期底部追加零过拟合通用边界提示：`[Note: If this question is about the User, do NOT use this record. This record belongs only to a third party (X), and you must NOT select any answer implied by X's record.]`（既保住第三方对话原话 `snip` 的 `R@10` 召回，又防止答题模型把同事/亲友的偏好张冠李戴到本人身上，且不含任何数据集特定人设词或强制选泛化项的跨卡污染指令）；
+  - 用户本人卡（`non_user_subjs` 为空）：直接展示原对话与前后邻居（`prev_line / anchor_line / next_line`），底部保留 `[提炼事实: <字面直接事实与隐式标签>]`（隐式标签统一为简洁中性的 `[隐式推导 / Implied: ...]`，去掉容易导致小模型不敢采纳本人隐式线索的消极免责声明）；
   - **死守坑 1 红线**：**所有卡片的 `prev_line / next_line` 问答对邻居拼接逻辑保持 100% 原样不动**，严禁裁剪或丢弃邻居。
 
 ---
@@ -395,7 +395,7 @@ flowchart TD
 
 在远端评测机（`root@47.242.148.141`，默认模型固定 `gpt-4o-mini`）从零重跑 `v3.1` 161 轮入库与 25 题评测（`/tmp/aml-eval/eval_v31_fix6.log`）：
 - **入库健康度**：`Active fact_items = 47`，`FN neutral chunks = 6`，`Profiles = 4`（本人落款 `Ananya` 自动归一至 `"user"`），`Total Tombstoned Chunks = 60`（`#12~#14`、`#20~#23`、`#87~#88` 精准墓碑化，零误杀正常轮次）；
-- **检索与答题成绩**：**`R@5 = 17/23 (73.9%) | R@10 = 21/23 (91.3%) | R@20 = 23/23 (100.0%) | MCQ = 14/25 (56.0%) [N = 12/23, F = 2/2, Leak = 0]`**（追平 `v2.4.2` 历史最高水位 `14/25`，且 `R@10` 从 `19/23 (82.6%)` 提升至 `21/23 (91.3%)`，`R@20` 达 `23/23 (100.0%)`）。
+- **检索与答题成绩**：**`R@5 = 17/23 (73.9%) | R@10 = 21/23 (91.3%) | R@20 = 23/23 (100.0%) | MCQ = 15/25 (60.0%) [N = 13/23, F = 2/2, Leak = 0]`**（突破 `v2.4.2 / v2.5` 历史水位 `14/25 -> 15/25 (60.0%)` 且零回退，`R@10` 从 `19/23 (82.6%)` 提升至 `21/23 (91.3%)`，`R@20` 达 `23/23 (100.0%)`）。
 
 ---
 
@@ -413,7 +413,7 @@ flowchart TD
 | **坑 6** | `v2.2 ~ v2.5` | **多切片长消息 `rerank_text` 锁死首段 `raw:0000`** | 长消息后半段命中高分切片 `raw:0001` 时，`rerank_text` 仍停留在首段 `raw:0000` 寒暄，导致 Reranker 误判低分。 | **高分切片必须同步刷新 `rerank_text`**（当 `c_rrf > existing.metadata["rrf_norm"]` 时，用高分切片实际文本更新 `rerank_text`）。 |
 | **坑 7** | `v2.4.0`，后在 `v2.4.1` (`b3e7e22`) 修复 | **一号总结模型（`_STATE_SUMMARY_PROMPT`）只抄后半句新状态、合槽后不同步回 `fact_item`** | 合槽总结丢了 `charity 5K run` 主语和旧值 `27:12`，导致 `LME-KU` 掉分（`8/8 -> 5/8`），且对话卡下方的 `[提炼事实]` 仍是未融合的半截旧话。 | **合槽必须保留完整主语与旧值演进**，并在 Stage 3 同步刷新存活槽位的 `fact_item` 与 `parent_messages.fact_notes`。 |
 | **坑 8** | `v2.4.2` (`002b285`)，后在 `5c88ce2` & `v2.5` 清理 | **显式遗忘按大类 Tag 连坐清空同标签无关记忆，或用 `request.options` 撞词/写评测集专有正则过拟合** | 仅因 `base_tg in tag_set`（`饮食/喜好`）就把无关的菠菜咖喱（`#37`）和买菜（`#44`）全删了；而用 `request.options` 撞词和头衔正则又造成严重的评测集过拟合。 | **零评测集硬编码 / 零 `request.options` 撞词**；遗忘题靠入库提炼通用 `neutral_topic`（`FN` 无偏向状态槽，`seq=0, parent_msg_id=None`）；有具体遗忘词时只删词面/语义命中记录，严禁按大类 Tag 连坐。 |
-| **坑 9** | `v3.1` 脑暴阶段 | **把“隐式推导（Implied）”直接当成“显式事实（Fact）”混写或入状态表** | 既侵犯用户边界（像窥探隐私），又会让推测污染或覆盖（supersede）用户亲口确认的直接事实。 | **`implied` 必须带显式 `[隐式推导 / Implied (非显式确认事实，优先级低于直接事实)]` 标签**，且通过数据源白名单物理禁入 `tag_timelines.current_state` 与 `summarize_state_slots`。 |
+| **坑 9** | `v3.1` 脑暴阶段 | **把“隐式推导（Implied）”直接当成“显式事实（Fact）”混写或入状态表，或在标签里写过度消极的免责词** | 混写进状态表会污染或覆盖（supersede）用户亲口确认的直接事实；而在标签内附带 `(非显式确认事实，优先级低于直接事实)` 消极免责词又会导致 `gpt-4o-mini` 在 `who=self` 隐式题上不敢采用本人线索。 | **`implied` 必须带显式但中性的 `[隐式推导 / Implied: ...]` 标签**（不加消极免责词），且通过数据源白名单物理禁入 `tag_timelines.current_state` 与 `summarize_state_slots`。 |
 | **坑 10** | `v3.1` 初版实测 (`68e105d`) | **① 加无条件 `0.80 * rrf_val` 保底；② 卡片顶行硬盖 `Owner: X (Do NOT attribute to User)`；③ 给 `FN` 塞宽泛大类词（`_BROAD_CATEGORY_CUES`）且 `fact:FN` 挂 `parent_msg_id`；④ `_is_high_spec_kw` 把 `len>=8`/带空格词当单字墓碑触发器** | 在同一份 `p10_v25_clean.sqlite3` 上 `MCQ` 从 **`14/25 (56%)` 跌至 `11/25 (44%)`**：① `#136 密码泄露` 靠 BM25 词撞锁死 `0.80` 霸占 `Q14` Top-1；② `#37` 本人签名信被顶行 `Do NOT attribute` 反杀丢掉 `Q17`；③ `FN13` 靠宽泛词冲进 `Q18` Top-2 毒化正常题；④ `_is_high_spec_kw` 凭 `scheduling / preparations` 单字误杀 19 轮正常对话。 | **① 严禁加 `0.80 * rrf_val` 无条件保底（保持 `0.55*r + 0.45*rrf`）；② 严禁在卡片顶行加 `Owner: ... (Do NOT attribute)` 死命令；③ 严禁向 `FN` 注入宽泛大类词，`fact:FN` 必须 `parent_msg_id=None`；④ `_is_high_spec_kw` 仅限单 token 内部大写驼峰词（如 `MealPrepPro`）；⑤ 默认模型写死 `gpt-4o-mini`。** |
 
 

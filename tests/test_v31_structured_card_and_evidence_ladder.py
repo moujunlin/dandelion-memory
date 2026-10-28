@@ -132,8 +132,7 @@ async def test_core1_implied_cue_extraction_and_whitelist_isolation(tmp_path: Pa
             "fact_item.search_text 必须拼入 implied 词以供向量/BM25 检索命中"
         )
         expected_implied_tag = (
-            "[隐式推导 / Implied (非显式确认事实，优先级低于直接事实): "
-            "eyeglasses, vision correction]"
+            "[隐式推导 / Implied: eyeglasses, vision correction]"
         )
         assert expected_implied_tag in str(f_row["display_text"]), (
             f"fact_item.display_text 必须以显式标签格式存储 implied，"
@@ -440,8 +439,7 @@ async def test_core1_structured_card_header_and_neighbor_preservation(tmp_path: 
         )
         assert "[提炼事实:" in user_card_content, "底部必须保留 [提炼事实: ...]"
         expected_implied_tag = (
-            "[隐式推导 / Implied (非显式确认事实，优先级低于直接事实): "
-            "eyeglasses, vision correction]"
+            "[隐式推导 / Implied: eyeglasses, vision correction]"
         )
         assert expected_implied_tag in user_card_content, (
             f"卡片提炼事实区必须包含隐式推导标签，实际内容:\n{user_card_content}"
