@@ -3,6 +3,7 @@
 # 与第十节「历次迭代踩坑与永久禁回退红线总表」
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import NamedTuple
 
@@ -16,7 +17,12 @@ from dandelion_memory.extractor import (
     sanitize_extraction_result,
 )
 from dandelion_memory.models import AddRequest, Message, SearchRequest
-from dandelion_memory.text import extract_keywords_from_target
+from dandelion_memory.store import SQLiteStore
+from dandelion_memory.text import (
+    extract_forget_target,
+    extract_keywords_from_target,
+    regex_extract_batch,
+)
 
 from .conftest import FakeExtractor, FakeReranker, build_v2_pipeline
 
@@ -1051,3 +1057,465 @@ async def test_forget_target_keywords_preserved_and_stopword_cleaned(tmp_path: P
         )
     finally:
         store.close()
+
+
+def test_v31_forget_collateral_tombstone_guards(tmp_path: Path):
+    """v3.1 遗忘误杀防线与细粒度墓碑守卫测试集 (TDD 红灯用例).
+
+    覆盖 4 个特定失败模式：
+    1. incidental 非祈使句误触发 extract_forget_target / regex_extract_batch
+    2. extract_keywords_from_target 的弯引号/拉丁重音/元词过滤与长 CJK 短语提取
+    3. execute_forget_action 中的 ASCII 单词边界与具体关键词守卫 (防 'de' in 'decade' 与泛词误杀)
+    4. trigger_seq - 1 前序 assistant 轮次的语义相似度遗忘守卫 (cosine >= 0.35 语义遗忘)
+    """
+    # 1. False-positive extract_forget_target / regex_extract_batch
+    # on incidental non-imperative sentences
+    incidental_msgs = [
+        "Rejections suck, but don't forget they don't define you.",
+        "I'll never forget seeing all of the characters and dialogue I wrote being acted out.",
+        "I always forget to bring my reusable bags to the grocery store.",
+        (
+            "It's the kind of brew that makes you temporarily forget about"
+            " deadlines.\n\nCheers,\nNatalia"
+        ),
+        "I don't remember the exact name of the product, but it was part of a new line.",
+        "You know what, forget it. I don't have time for your useless responses.",
+    ]
+    for msg in incidental_msgs:
+        assert extract_forget_target(msg) is None, (
+            f"extract_forget_target must return None for incidental non-imperative sentence:"
+            f" {msg!r}"
+        )
+        regex_res = regex_extract_batch([{"role": "user", "seq": 1, "content": msg}])
+        assert len(regex_res.get("forget_actions", [])) == 0, (
+            "regex_extract_batch must produce 0 forget_actions for incidental"
+            f" non-imperative sentence: {msg!r}"
+        )
+
+    genuine_msgs = [
+        "Please forget that I observe Día de los Muertos each year.",
+        "Forget that I follow international cricket.",
+        "请忘记我之前提到的“偏好独立完成艺术创作项目而非团队合作”这一偏好。",
+    ]
+    for msg in genuine_msgs:
+        target = extract_forget_target(msg)
+        assert target is not None and len(target.strip()) > 0, (
+            "extract_forget_target must return a non-empty target for genuine forget"
+            f" instruction: {msg!r}"
+        )
+
+    # 2. extract_keywords_from_target curly apostrophes, Latin accents,
+    # meta-words, and CJK long clauses
+    kws1 = extract_keywords_from_target("the fact that I’ve struggled with mild social anxiety")
+    assert "ve" not in [k.casefold() for k in kws1], f"'ve' must NOT be in keywords: {kws1}"
+    assert "fact" not in [k.casefold() for k in kws1], f"'fact' must NOT be in keywords: {kws1}"
+
+    kws2 = extract_keywords_from_target("I observe Día de los Muertos each year")
+    assert "de" not in [k.casefold() for k in kws2], f"'de' must NOT be in keywords: {kws2}"
+    assert "los" not in [k.casefold() for k in kws2], f"'los' must NOT be in keywords: {kws2}"
+    assert any(
+        k in ("Día", "Muertos") or "día" in k.casefold() or "muertos" in k.casefold() for k in kws2
+    ), f"MUST contain 'Día' (or 'Muertos'): {kws2}"
+
+    kws3 = extract_keywords_from_target("I like solving crossword puzzles from your memory")
+    assert "memory" not in [k.casefold() for k in kws3], f"'memory' must NOT be in keywords: {kws3}"
+
+    kws4 = extract_keywords_from_target(
+        "我之前提到的“偏好独立完成艺术创作项目而非团队合作”这一偏好"
+    )
+    assert kws4 != ["偏好"], f"keywords must not simply be ['偏好']: {kws4}"
+    assert not any("我之前提到" in k for k in kws4), f"'我之前提到' must NOT be in keywords: {kws4}"
+    assert not any("这一偏好" in k for k in kws4), f"'这一偏好' must NOT be in keywords: {kws4}"
+    assert any("独立完成艺术创作项目" in k for k in kws4), (
+        f"'独立完成艺术创作项目' MUST be in keywords: {kws4}"
+    )
+    assert any("团队合作" in k for k in kws4), f"'团队合作' MUST be in keywords: {kws4}"
+
+    # 3. ASCII word-boundary & specific-keyword guard in execute_forget_action (store.py)
+    store = SQLiteStore(str(tmp_path / "collateral.sqlite"))
+    try:
+        # Turn #1 (user) + #2 (assistant)
+        store.insert_parent_message(
+            msg_id="m1",
+            user_id="u1",
+            session_id="s1",
+            request_id="r1",
+            seq=1,
+            role="user",
+            speaker="user",
+            content=(
+                "I've been working as a Senior Accountant at Mesa Financial Services"
+                " for over a decade, guiding clients through reporting needs."
+            ),
+            session_ts=1001,
+            session_time_str="2026-01-01T00:00:01Z",
+        )
+        store.insert_parent_message(
+            msg_id="m2",
+            user_id="u1",
+            session_id="s1",
+            request_id="r1",
+            seq=2,
+            role="assistant",
+            speaker="assistant",
+            content=(
+                "Here is a refined bio for your Senior Accountant role with over a"
+                " decade of experience."
+            ),
+            session_ts=1002,
+            session_time_str="2026-01-01T00:00:02Z",
+        )
+        # Turn #3 (user) + #4 (assistant)
+        store.insert_parent_message(
+            msg_id="m3",
+            user_id="u1",
+            session_id="s1",
+            request_id="r1",
+            seq=3,
+            role="user",
+            speaker="user",
+            content=(
+                "When partnering with small-business owners, I draw a parallel to preparing"
+                " the traditional stews my family has made for generations."
+            ),
+            session_ts=1003,
+            session_time_str="2026-01-01T00:00:03Z",
+        )
+        store.insert_parent_message(
+            msg_id="m4",
+            user_id="u1",
+            session_id="s1",
+            request_id="r1",
+            seq=4,
+            role="assistant",
+            speaker="assistant",
+            content=(
+                "Drawing a parallel between traditional stews and business consulting"
+                " helps clients connect with your family values."
+            ),
+            session_ts=1004,
+            session_time_str="2026-01-01T00:00:04Z",
+        )
+        # Turn #5 (user) + #6 (assistant)
+        store.insert_parent_message(
+            msg_id="m5",
+            user_id="u1",
+            session_id="s1",
+            request_id="r1",
+            seq=5,
+            role="user",
+            speaker="user",
+            content="For your Día de los Muertos altar, you can arrange marigolds.",
+            session_ts=1005,
+            session_time_str="2026-01-01T00:00:05Z",
+        )
+        store.insert_parent_message(
+            msg_id="m6",
+            user_id="u1",
+            session_id="s1",
+            request_id="r1",
+            seq=6,
+            role="assistant",
+            speaker="assistant",
+            content="Please forget that I observe Día de los Muertos each year.",
+            session_ts=1006,
+            session_time_str="2026-01-01T00:00:06Z",
+        )
+        # Turn #7 (user) + #8 (assistant)
+        store.insert_parent_message(
+            msg_id="m7",
+            user_id="u1",
+            session_id="s1",
+            request_id="r1",
+            seq=7,
+            role="user",
+            speaker="user",
+            content="Understood, I will no longer bring that up.",
+            session_ts=1007,
+            session_time_str="2026-01-01T00:00:07Z",
+        )
+        store.insert_parent_message(
+            msg_id="m8",
+            user_id="u1",
+            session_id="s1",
+            request_id="r1",
+            seq=8,
+            role="assistant",
+            speaker="assistant",
+            content=(
+                "Please forget that I enjoy traditional mariachi music during"
+                " family gatherings."
+            ),
+            session_ts=1008,
+            session_time_str="2026-01-01T00:00:08Z",
+        )
+
+        turns = [
+            (
+                1,
+                "m1",
+                (
+                    "I've been working as a Senior Accountant at Mesa Financial Services"
+                    " for over a decade, guiding clients through reporting needs."
+                ),
+            ),
+            (
+                2,
+                "m2",
+                (
+                    "Here is a refined bio for your Senior Accountant role with over a"
+                    " decade of experience."
+                ),
+            ),
+            (
+                3,
+                "m3",
+                (
+                    "When partnering with small-business owners, I draw a parallel to preparing"
+                    " the traditional stews my family has made for generations."
+                ),
+            ),
+            (
+                4,
+                "m4",
+                (
+                    "Drawing a parallel between traditional stews and business consulting"
+                    " helps clients connect with your family values."
+                ),
+            ),
+            (5, "m5", "For your Día de los Muertos altar, you can arrange marigolds."),
+            (6, "m6", "Please forget that I observe Día de los Muertos each year."),
+            (7, "m7", "Understood, I will no longer bring that up."),
+            (
+                8,
+                "m8",
+                (
+                    "Please forget that I enjoy traditional mariachi music during"
+                    " family gatherings."
+                ),
+            ),
+        ]
+        for seq, mid, text in turns:
+            store.upsert_chunk(
+                chunk_id=f"c_{seq}",
+                user_id="u1",
+                session_id="s1",
+                parent_msg_id=mid,
+                seq=seq,
+                session_ts=1000 + seq,
+                kind="raw_slice",
+                subject="user",
+                tag=None,
+                display_text=text,
+                search_text=text,
+                bm25_tokens=text,
+                event_time_start=None,
+                event_time_end=None,
+                embedding=[0.05] * 8,
+            )
+
+        kws_6 = extract_keywords_from_target("I observe Día de los Muertos each year")
+        store.execute_forget_action(
+            user_id="u1",
+            trigger_seq=6,
+            batch_seqs_to_tombstone=[6],
+            target_existing_tags=[],
+            target_keywords=kws_6,
+            target_description="I observe Día de los Muertos each year",
+            target_vector=None,
+        )
+
+        kws_8 = extract_keywords_from_target(
+            "I enjoy traditional mariachi music during family gatherings"
+        )
+        store.execute_forget_action(
+            user_id="u1",
+            trigger_seq=8,
+            batch_seqs_to_tombstone=[8],
+            target_existing_tags=[],
+            target_keywords=kws_8,
+            target_description="I enjoy traditional mariachi music during family gatherings",
+            target_vector=None,
+        )
+
+        msg_rows = {
+            r["seq"]: r["tombstoned"]
+            for r in store._connect()
+            .execute("SELECT seq, tombstoned FROM parent_messages WHERE user_id = 'u1'")
+            .fetchall()
+        }
+        assert msg_rows[1] == 0, (
+            "Turn #1 must remain tombstoned == 0 (no 'de' in 'decade' collateral),"
+            f" got {msg_rows[1]}"
+        )
+        assert msg_rows[2] == 0, (
+            "Turn #2 must remain tombstoned == 0 (no 'de' in 'decade' collateral),"
+            f" got {msg_rows[2]}"
+        )
+        assert msg_rows[3] == 0, (
+            "Turn #3 must remain tombstoned == 0 (generic 'traditional'/'family' without"
+            f" 'mariachi'), got {msg_rows[3]}"
+        )
+        assert msg_rows[4] == 0, (
+            "Turn #4 must remain tombstoned == 0 (generic 'traditional'/'family' without"
+            f" 'mariachi'), got {msg_rows[4]}"
+        )
+        assert msg_rows[5] == 1, (
+            f"Turn #5 must be tombstoned == 1 (Día de los Muertos altar), got {msg_rows[5]}"
+        )
+
+        # 4. Immediate preceding assistant turn (trigger_seq - 1) semantic forget guard
+        dim = 8
+        target_vec = [1.0] + [0.0] * (dim - 1)
+        cos_val = 0.363
+        sin_val = math.sqrt(1.0 - cos_val * cos_val)
+        asst_vec = [cos_val, sin_val] + [0.0] * (dim - 2)
+
+        store.insert_parent_message(
+            msg_id="m9",
+            user_id="u1",
+            session_id="s2",
+            request_id="r9",
+            seq=9,
+            role="assistant",
+            speaker="assistant",
+            content=(
+                "We can arrange colorful autumn botanicals and decorative garlands for"
+                " seasonal setup."
+            ),
+            session_ts=2001,
+            session_time_str="2026-01-02T00:00:01Z",
+        )
+        store.upsert_chunk(
+            chunk_id="c_9",
+            user_id="u1",
+            session_id="s2",
+            parent_msg_id="m9",
+            seq=9,
+            session_ts=2001,
+            kind="raw_slice",
+            subject="user",
+            tag=None,
+            display_text=(
+                "We can arrange colorful autumn botanicals and decorative garlands for"
+                " seasonal setup."
+            ),
+            search_text=(
+                "We can arrange colorful autumn botanicals and decorative garlands for"
+                " seasonal setup."
+            ),
+            bm25_tokens="autumn botanicals decorative garlands seasonal setup",
+            event_time_start=None,
+            event_time_end=None,
+            embedding=asst_vec,
+        )
+
+        store.insert_parent_message(
+            msg_id="m10",
+            user_id="u1",
+            session_id="s2",
+            request_id="r10",
+            seq=10,
+            role="user",
+            speaker="user",
+            content="Please forget that I observe Día de los Muertos each year.",
+            session_ts=2002,
+            session_time_str="2026-01-02T00:00:02Z",
+        )
+
+        store.execute_forget_action(
+            user_id="u1",
+            trigger_seq=10,
+            batch_seqs_to_tombstone=[10],
+            target_existing_tags=[],
+            target_keywords=["Día", "Muertos"],
+            target_description="I observe Día de los Muertos each year",
+            target_vector=target_vec,
+        )
+
+        m9_row = (
+            store._connect()
+            .execute("SELECT tombstoned FROM parent_messages WHERE msg_id = 'm9'")
+            .fetchone()
+        )
+        assert m9_row is not None and m9_row["tombstoned"] == 1, (
+            "Preceding assistant turn (seq=9, trigger_seq-1) must be tombstoned == 1 "
+            f"due to semantic cosine_similarity >= 0.35 ({cos_val}),"
+            f" got {m9_row['tombstoned'] if m9_row else None}"
+        )
+
+        # Negative check: unrelated preceding assistant turn with cos_sim = 0.15 < 0.34
+        # must remain tombstoned == 0
+        cos_val_low = 0.15
+        sin_val_low = math.sqrt(1.0 - cos_val_low * cos_val_low)
+        asst_vec_low = [cos_val_low, sin_val_low] + [0.0] * (dim - 2)
+
+        store.insert_parent_message(
+            msg_id="m11",
+            user_id="u1",
+            session_id="s3",
+            request_id="r11",
+            seq=11,
+            role="assistant",
+            speaker="assistant",
+            content="The quarterly financial audit completed with zero compliance discrepancies.",
+            session_ts=3001,
+            session_time_str="2026-01-03T00:00:01Z",
+        )
+        store.upsert_chunk(
+            chunk_id="c_11",
+            user_id="u1",
+            session_id="s3",
+            parent_msg_id="m11",
+            seq=11,
+            session_ts=3001,
+            kind="raw_slice",
+            subject="user",
+            tag=None,
+            display_text=(
+                "The quarterly financial audit completed with zero compliance discrepancies."
+            ),
+            search_text=(
+                "The quarterly financial audit completed with zero compliance discrepancies."
+            ),
+            bm25_tokens="quarterly financial audit compliance discrepancies",
+            event_time_start=None,
+            event_time_end=None,
+            embedding=asst_vec_low,
+        )
+
+        store.insert_parent_message(
+            msg_id="m12",
+            user_id="u1",
+            session_id="s3",
+            request_id="r12",
+            seq=12,
+            role="user",
+            speaker="user",
+            content="Please forget that I observe Día de los Muertos each year.",
+            session_ts=3002,
+            session_time_str="2026-01-03T00:00:02Z",
+        )
+
+        store.execute_forget_action(
+            user_id="u1",
+            trigger_seq=12,
+            batch_seqs_to_tombstone=[12],
+            target_existing_tags=[],
+            target_keywords=["Día", "Muertos"],
+            target_description="I observe Día de los Muertos each year",
+            target_vector=target_vec,
+        )
+
+        m11_row = (
+            store._connect()
+            .execute("SELECT tombstoned FROM parent_messages WHERE msg_id = 'm11'")
+            .fetchone()
+        )
+        assert m11_row is not None and m11_row["tombstoned"] == 0, (
+            "Unrelated preceding assistant turn (seq=11) must remain tombstoned == 0 "
+            f"when cos_sim = {cos_val_low} < 0.34, got {m11_row['tombstoned'] if m11_row else None}"
+        )
+    finally:
+        store.close()
+
