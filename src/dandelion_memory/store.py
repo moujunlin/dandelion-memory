@@ -2061,22 +2061,6 @@ class SQLiteStore:
             >= (2 if len(kw_list) == 1 else 3)
         ]
 
-        def _kw_hit(kw: str, lower_text: str, c_terms: set[str]) -> bool:
-            if kw.casefold() in lower_text:
-                return True
-            parts = kw.split()
-            if not parts:
-                return False
-            for part in parts:
-                if part.casefold() in lower_text:
-                    continue
-                if any("\u3400" <= ch <= "\u9fff" for ch in part):
-                    return False
-                p_toks = set(tokenize_bm25(part))
-                if not p_toks or not (p_toks & c_terms):
-                    return False
-            return True
-
         _generic_cat_words = {
             "饮食", "喜好", "偏好", "食物", "口味", "diet", "food", "meal", "meals",
             "preference", "preferences", "兴趣", "日常", "习惯", "爱好", "hobby",
@@ -2088,7 +2072,31 @@ class SQLiteStore:
             "activity", "activities", "event", "events", "weekend", "routine", "routines",
             "attend", "attends", "attended", "attending", "enjoy", "enjoys", "enjoyed",
             "enjoying", "follow", "follows", "followed", "following", "prep", "planning",
+            "detail", "details", "fact", "facts", "memory", "memories", "remember",
+            "traditional", "family", "friends", "friend",
         }
+
+        tag_tokens = {t.casefold() for tg_item in tag_set for t in tokenize_bm25(tg_item)}
+        specific_kw_tokens = {
+            t.casefold()
+            for kw in kw_list
+            for t in tokenize_bm25(kw)
+            if t.casefold() not in _generic_cat_words and t.casefold() not in tag_tokens
+        }
+        has_specific_kws = bool(specific_kw_tokens) and not bool(target_id)
+
+        def _is_spec_kw(kw: str) -> bool:
+            clean = kw.strip()
+            if any("\u3400" <= ch <= "\u9fff" for ch in clean):
+                return True
+            if any(ord(c) >= 128 for c in clean):
+                return clean.casefold() not in _generic_cat_words
+            toks = [
+                t.casefold()
+                for t in tokenize_bm25(clean)
+                if t.casefold() not in _generic_cat_words and t.casefold() not in tag_tokens
+            ]
+            return bool(toks)
 
         specific_token_kws = [
             t
@@ -2097,11 +2105,69 @@ class SQLiteStore:
             )
             if t.strip().casefold() not in _generic_cat_words
         ]
+        spec_kw_set = {kw for kw in kw_list if _is_spec_kw(kw)}
+        kw_tok_cache: dict[str, set[str]] = {}
+        for kw_item in (*kw_list, *specific_token_kws):
+            for part in kw_item.split():
+                if all(ord(c) < 128 for c in part) and part not in kw_tok_cache:
+                    kw_tok_cache[part] = set(tokenize_bm25(part))
+
+        def _kw_hit(kw: str, lower_text: str, c_terms: set[str], text_combined: str = "") -> bool:
+            if not kw:
+                return False
+            is_cjk = any("\u3400" <= ch <= "\u9fff" for ch in kw)
+            if is_cjk:
+                return kw.casefold() in lower_text
+            if " " not in kw:
+                if all(ord(c) < 128 for c in kw):
+                    p_toks = kw_tok_cache.get(kw)
+                    if p_toks is None:
+                        p_toks = set(tokenize_bm25(kw))
+                        kw_tok_cache[kw] = p_toks
+                    if p_toks:
+                        return bool(p_toks & c_terms)
+                kw_low = kw.casefold()
+                if kw_low not in lower_text:
+                    return False
+                return bool(
+                    re.search(
+                        rf"(?i)(?<![A-Za-z\u00C0-\u024F0-9_]){re.escape(kw)}(?![A-Za-z\u00C0-\u024F0-9_])",
+                        text_combined or lower_text,
+                    )
+                )
+            parts = kw.split()
+            if not parts:
+                return False
+            for part in parts:
+                if any("\u3400" <= ch <= "\u9fff" for ch in part):
+                    if part.casefold() not in lower_text:
+                        return False
+                else:
+                    if all(ord(c) < 128 for c in part):
+                        p_toks = kw_tok_cache.get(part)
+                        if p_toks is None:
+                            p_toks = set(tokenize_bm25(part))
+                            kw_tok_cache[part] = p_toks
+                        if p_toks:
+                            if p_toks & c_terms:
+                                continue
+                            return False
+                    if part.casefold() in lower_text and re.search(
+                        rf"(?i)(?<![A-Za-z\u00C0-\u024F0-9_]){re.escape(part)}(?![A-Za-z\u00C0-\u024F0-9_])",
+                        text_combined or lower_text,
+                    ):
+                        continue
+                    return False
+            return True
 
         def _is_high_spec_kw(kw: str) -> bool:
             clean = kw.strip()
             return bool(
-                any(c.isupper() for c in clean[1:]) and " " not in clean and "-" not in clean
+                len(clean) >= 4
+                and any(c.isupper() for c in clean[1:])
+                and any(c.islower() for c in clean)
+                and " " not in clean
+                and "-" not in clean
             )
 
         def _lexical_forget_match(text_combined: str) -> bool:
@@ -2112,21 +2178,33 @@ class SQLiteStore:
                 return True
             c_terms = set(tokenize_bm25(text_combined))
             if kw_list:
-                for kw in kw_list:
-                    if _is_high_spec_kw(kw) and _kw_hit(kw, lower_text, c_terms):
-                        return True
-                kw_hits = sum(1 for kw in kw_list if _kw_hit(kw, lower_text, c_terms))
+                if len(kw_list) <= 4:
+                    for kw in kw_list:
+                        if _is_high_spec_kw(kw) and _kw_hit(
+                            kw, lower_text, c_terms, text_combined
+                        ):
+                            return True
+                matched_kws = [
+                    kw for kw in kw_list if _kw_hit(kw, lower_text, c_terms, text_combined)
+                ]
+                kw_hits = len(matched_kws)
                 if len(kw_list) <= 2:
                     if kw_hits == len(kw_list):
                         return True
                     if len(specific_token_kws) >= 3:
                         tok_hits = sum(
-                            1 for kw in specific_token_kws if _kw_hit(kw, lower_text, c_terms)
+                            1
+                            for kw in specific_token_kws
+                            if _kw_hit(kw, lower_text, c_terms, text_combined)
                         )
                         if tok_hits >= 3 and (tok_hits / len(specific_token_kws)) >= 0.6:
                             return True
                     return False
                 if (kw_hits / len(kw_list)) >= 0.35:
+                    if spec_kw_set:
+                        spec_hits = sum(1 for kw in matched_kws if kw in spec_kw_set)
+                        if spec_hits < 1:
+                            return False
                     return True
             elif target_terms:
                 matched_terms = target_terms & c_terms
@@ -2135,14 +2213,6 @@ class SQLiteStore:
                 if (len(matched_terms) / len(target_terms)) >= 0.35:
                     return True
             return False
-        tag_tokens = {t.casefold() for tg_item in tag_set for t in tokenize_bm25(tg_item)}
-        specific_kw_tokens = {
-            t.casefold()
-            for kw in kw_list
-            for t in tokenize_bm25(kw)
-            if t.casefold() not in _generic_cat_words and t.casefold() not in tag_tokens
-        }
-        has_specific_kws = bool(specific_kw_tokens) and not bool(target_id)
 
         conn = self._connect()
         # 1. Check tag_timelines (respecting seq <= trigger_seq causal boundary)
@@ -2409,9 +2479,16 @@ class SQLiteStore:
                     rebuilt_timelines.append((subj, tg, r_sum, l_seq, l_ts))
 
         # 2. Check search_chunks with causal boundary seq <= trigger_seq
+        trig_pm_row = conn.execute(
+            "SELECT session_id FROM parent_messages "
+            "WHERE user_id = ? AND seq = ? AND role = 'user'",
+            (user_id, trigger_seq),
+        ).fetchone()
+        trigger_session_id = str(trig_pm_row["session_id"]) if trig_pm_row else ""
+
         chunk_rows = conn.execute(
             """
-            SELECT chunk_id, parent_msg_id, slot_id, seq, kind, subject, tag,
+            SELECT chunk_id, parent_msg_id, session_id, slot_id, seq, kind, subject, tag,
                    display_text, search_text, embedding
             FROM search_chunks
             WHERE user_id = ? AND tombstoned = 0 AND seq <= ?
@@ -2483,9 +2560,22 @@ class SQLiteStore:
                     disp_low = disp.casefold()
                     disp_terms = set(tokenize(disp))
                     hit_cnt = sum(
-                        1 for kw in specific_token_kws if _kw_hit(kw, disp_low, disp_terms)
+                        1 for kw in specific_token_kws if _kw_hit(kw, disp_low, disp_terms, disp)
                     )
                     if hit_cnt >= 2:
+                        hit = True
+                elif (
+                    cos_sim >= 0.34
+                    and c_seq == trigger_seq - 1
+                    and trigger_session_id
+                    and str(r["session_id"] or "") == trigger_session_id
+                ):
+                    asst_row = conn.execute(
+                        "SELECT 1 FROM parent_messages WHERE user_id = ? AND session_id = ? "
+                        "AND seq = ? AND role = 'assistant'",
+                        (user_id, trigger_session_id, c_seq),
+                    ).fetchone()
+                    if asst_row is not None:
                         hit = True
 
             if hit:
@@ -2544,7 +2634,7 @@ class SQLiteStore:
                     (pmid,),
                 )
             paired_assistant_hit = is_paired_with_tombstoned_user and bool(
-                kw_list and any(_kw_hit(kw, p_lower, p_terms) for kw in kw_list)
+                kw_list and any(_kw_hit(kw, p_lower, p_terms, p_content) for kw in kw_list)
             )
             if pmid not in affected_parent_ids and not direct_kw_hit and not paired_assistant_hit:
                 continue
@@ -2587,9 +2677,17 @@ class SQLiteStore:
                         (pmid,),
                     ).fetchall()
                 }
-                is_multi_topic = len(distinct_tags) >= 2 or any(
-                    is_incidental_update_text(str(rs["display_text"] or ""))
-                    for rs in raw_slices
+                is_multi_topic = (
+                    len(distinct_tags) >= 2
+                    or any(
+                        is_incidental_update_text(str(rs["display_text"] or ""))
+                        for rs in raw_slices
+                    )
+                    or (
+                        len(raw_slices) >= 3
+                        and p_seq != trigger_seq - 1
+                        and not is_paired_with_tombstoned_user
+                    )
                 )
                 if len(raw_slices) <= 1 or not is_multi_topic:
                     conn.execute(
@@ -2624,7 +2722,20 @@ class SQLiteStore:
                     ).fetchone()
                     active_slice_cnt = int(counts_row["active_cnt"] or 0)
                     tomb_slice_cnt = int(counts_row["tomb_cnt"] or 0)
-                    if active_slice_cnt == 0 or (direct_kw_hit and tomb_slice_cnt == 0):
+                    total_slices = active_slice_cnt + tomb_slice_cnt
+                    if (
+                        active_slice_cnt == 0
+                        or (
+                            direct_kw_hit
+                            and tomb_slice_cnt == 0
+                            and (len(raw_slices) <= 3 or is_paired_with_tombstoned_user)
+                        )
+                        or (
+                            len(raw_slices) >= 3
+                            and total_slices > 0
+                            and (tomb_slice_cnt / total_slices) >= 0.5
+                        )
+                    ):
                         conn.execute(
                             "UPDATE parent_messages SET tombstoned = 1 WHERE msg_id = ?",
                             (pmid,),

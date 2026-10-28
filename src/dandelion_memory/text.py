@@ -172,6 +172,20 @@ _FORGET_STOPWORDS = _EN_STOPWORDS | {
     "not",
     "use",
     "using",
+    "detail",
+    "details",
+    "fact",
+    "facts",
+    "memory",
+    "memories",
+    "remember",
+    "remembering",
+    "mentioned",
+    "mention",
+    "de",
+    "los",
+    "la",
+    "el",
 }
 
 _FORGET_PATTERNS = (
@@ -195,8 +209,37 @@ _EXPLICIT_FORGET_ROOT_RE = re.compile(
     r"忘掉|忘记|删除|抹除|擦除|抹掉|别再记得|不要记得|别记得|不再记得|不要再提|别再提)"
 )
 
+_FORGET_INCIDENTAL_PRECEDING_RE = re.compile(
+    r"(?i)\b(?:don'?t|do\s+not|never|ever|not\s+to|shouldn'?t|can'?t|cannot|won'?t|wouldn'?t|"
+    r"always|seem\s+to|tend\s+to|easy\s+to|help(?:s|ed)?(?:\s+to)?|"
+    r"make(?:s)?\s+(?:you|me|us)(?:\s+\w+)?)\s+forget\b"
+)
+_FORGET_INCIDENTAL_FOLLOWING_RE = re.compile(
+    r"(?i)^(?:to\s+\w+|it\b|my\s+troubles\b|about\s+the\s+stresses\b)"
+)
+_REMEMBER_PRONOUN_PRECEDING_RE = re.compile(
+    r"(?i)\b(?:i|we|you|he|she|they)\s+(?:don'?t|do\s+not|never)\s+(?:remember|mention)\b"
+)
+_DELETE_PREFIX_RE = re.compile(
+    r"(?i)^(?:please\s+)?(?:delete|erase|remove|wipe)\s+(?:that|about|my|what)\b"
+)
+_MEMORY_NOUN_RE = re.compile(
+    r"(?i)\b(?:the\s+|my\s+)?(?:memory|memories|information|record|records|detail|details|"
+    r"fact|facts|preference|preferences)\b"
+)
+_ENGLISH_FORGET_OPENER_RE = re.compile(
+    r"(?i)^(?:(?:hey|hi|actually|also|by\s+the\s+way)[,\s]+)?(?:(?:please|can\s+you|could\s+you|"
+    r"would\s+you|i'?d\s+like\s+you\s+to|i\s+want\s+you\s+to)\s+)?forget\b"
+)
+_ENGLISH_FORGET_AFTER_PUNCT_RE = re.compile(
+    r"(?i)(?:^|[.!?\n]\s*)(?:please\s+)?forget(?:\s+(?:everything\s+)?(?:about|that|of))?\s+(.+)$",
+    re.DOTALL,
+)
+
 _TRAILING_FORGET_NOISE_RE = re.compile(
-    r"(?:这件事|那件事|的记忆|的记录|的信息|，?不要再提了?|，?别再提了?)+$"
+    r"(?i)(?:\s+(?:from|in)\s+(?:your|my|the)\s+(?:memory|memories|records?)|"
+    r"[”\"'」]?(?:这一偏好|这个偏好|这项偏好|的偏好|这一习惯|这个习惯|这一事实|这个事实|"
+    r"这件事|那件事|的记忆|的记录|的信息|，?不要再提了?|，?别再提了?))+$"
 )
 
 
@@ -549,12 +592,6 @@ def slice_message_content(
     return slices
 
 
-def has_explicit_forget_keyword(text: str) -> bool:
-    if not text:
-        return False
-    return bool(_EXPLICIT_FORGET_ROOT_RE.search(text))
-
-
 def split_text(text: str, target: int = 1200, maximum: int = 1800) -> list[str]:
     if len(text) <= maximum:
         return [text]
@@ -608,27 +645,127 @@ def render_write_items(
 
 
 def extract_forget_target(text: str) -> str | None:
-    stripped = text.strip().strip(".。!?！？")
-    for pattern in _FORGET_PATTERNS:
-        match = pattern.search(stripped)
-        if match:
-            target = match.group(1).strip().strip(".。!?！？\"'")
+    if not text:
+        return None
+    stripped = text.strip()
+    stripped = _SPEAKER_PREFIX_RE.sub("", stripped).strip().strip(".。!?！？")
+    if not stripped:
+        return None
+
+    # 1. Chinese patterns
+    cn_match = re.search(
+        r"(?s)(?:请|麻烦|帮我)?(?:忘掉|忘记|删除|抹除|擦除|抹掉|别再记得|不要记得|不要再提|别再提)"
+        r"(?:关于|我说过的|那件事|这件事|的记忆|的记录|：|:)?\s*(.+)$",
+        stripped,
+    )
+    if cn_match:
+        target = cn_match.group(1).strip().strip(".。!?！？\"'")
+        target = _TRAILING_FORGET_NOISE_RE.sub("", target).strip().strip(".。!?！？\"'")
+        if len(target) >= 2:
+            return target
+
+    # 2. English forget
+    if re.search(r"(?i)\bforget\b", stripped):
+        # Reject if preceded by incidental negations/auxiliaries
+        if _FORGET_INCIDENTAL_PRECEDING_RE.search(stripped):
+            return None
+
+        target = None
+        if _ENGLISH_FORGET_OPENER_RE.search(stripped):
+            m = re.search(
+                r"(?i)^(?:(?:hey|hi|actually|also|by\s+the\s+way)[,\s]+)?(?:(?:please|can\s+you|"
+                r"could\s+you|would\s+you|i'?d\s+like\s+you\s+to|i\s+want\s+you\s+to)\s+)?"
+                r"forget(?:\s+(?:everything\s+)?(?:about|that|of))?\s+(.+)$",
+                stripped,
+                re.DOTALL,
+            )
+            if m:
+                target = m.group(1).strip().strip(".。!?！？\"'")
+        elif len(stripped) <= 240:
+            punct_m = _ENGLISH_FORGET_AFTER_PUNCT_RE.search(stripped)
+            if punct_m:
+                target = punct_m.group(1).strip().strip(".。!?！？\"'")
+
+        if target is not None and not _FORGET_INCIDENTAL_FOLLOWING_RE.search(target):
             target = _TRAILING_FORGET_NOISE_RE.sub("", target).strip().strip(".。!?！？\"'")
             if len(target) >= 2:
                 return target
+        return None
+
+    # 3. English remember / mention
+    rem_match = re.search(
+        r"(?is)\b(?:don'?t|do\s+not|never)\s+(?:remember|mention)\s+(?:that\s+|about\s+)?(.+)$",
+        stripped,
+    )
+    if rem_match:
+        if _REMEMBER_PRONOUN_PRECEDING_RE.search(stripped):
+            return None
+        target = rem_match.group(1).strip().strip(".。!?！？\"'")
+        target = _TRAILING_FORGET_NOISE_RE.sub("", target).strip().strip(".。!?！？\"'")
+        if len(target) >= 2:
+            return target
+
+    # 4. English delete / erase / remove / wipe
+    del_match = re.search(
+        r"(?is)\b(?:please\s+)?(?:delete|erase|remove|wipe)\s+(?:the\s+)?"
+        r"(?:memory|memories|information|record|records)?\s*(?:about|of|that)?\s+(.+)$",
+        stripped,
+    )
+    if del_match:
+        has_mem_noun = bool(_MEMORY_NOUN_RE.search(stripped))
+        starts_with_del = bool(_DELETE_PREFIX_RE.search(stripped))
+        if has_mem_noun or starts_with_del:
+            target = del_match.group(1).strip().strip(".。!?！？\"'")
+            target = _TRAILING_FORGET_NOISE_RE.sub("", target).strip().strip(".。!?！？\"'")
+            if len(target) >= 2:
+                return target
+
     return None
 
 
+def has_explicit_forget_keyword(text: str) -> bool:
+    if not text:
+        return False
+    if extract_forget_target(text) is not None:
+        return True
+    if not _EXPLICIT_FORGET_ROOT_RE.search(text):
+        return False
+    if _FORGET_INCIDENTAL_PRECEDING_RE.search(text):
+        return False
+    if _REMEMBER_PRONOUN_PRECEDING_RE.search(text):
+        return False
+    return not (
+        re.search(r"(?i)\b(?:delete|erase|remove|wipe)\b", text)
+        and not (_MEMORY_NOUN_RE.search(text) or _DELETE_PREFIX_RE.search(text))
+    )
+
+
 def extract_keywords_from_target(target: str) -> list[str]:
+    target = target.replace("’", "'").replace("‘", "'")
+    target = re.sub(r"(?i)'(?:ve|ll|re|m|d|s)\b", "", target)
+    target = re.sub(r"(?i)n't\b", "", target)
     cleaned = _TRAILING_FORGET_NOISE_RE.sub("", target).strip()
     keywords: list[str] = []
-    for token in re.findall(r"[A-Za-z0-9_-]{2,}", cleaned):
+    for token in re.findall(r"[A-Za-z\u00C0-\u024F0-9_-]{2,}", cleaned):
         if token.casefold() not in _FORGET_STOPWORDS and token not in keywords:
             keywords.append(token)
     for cjk_chunk in re.findall(r"[\u3400-\u9fff]+", cleaned):
-        for seg in re.split(r"[的在是把了和与及]+", cjk_chunk):
+        cjk_chunk = re.sub(
+            r"^(?:我之前提到的|我以前提到的|我曾提到的|我提到的|关于我)+", "", cjk_chunk
+        )
+        for seg in re.split(r"[的在是把了和与及]|(?:而非|而不是|以及|或者|并且)+", cjk_chunk):
             seg = seg.strip()
-            if 2 <= len(seg) <= 12 and seg not in keywords:
+            trimmed = re.sub(
+                r"^(?:这一偏好|这个偏好|偏好|我喜欢|我不喜欢|我习惯|我不习惯|我偶尔|我很少|我不会)+",
+                "",
+                seg,
+            )
+            if len(trimmed) >= 2:
+                seg = trimmed
+            trimmed = re.sub(r"(?:这一偏好|这个偏好|偏好)+$", "", seg)
+            if len(trimmed) >= 2:
+                seg = trimmed
+            if 2 <= len(seg) <= 14 and seg not in keywords:
                 keywords.append(seg)
     if not keywords and len(cleaned) >= 2:
         keywords.append(cleaned)

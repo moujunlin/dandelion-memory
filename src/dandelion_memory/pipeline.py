@@ -2327,6 +2327,23 @@ class MemoryPipeline:
             )
             selected_dlg = [c for c in ordered_for_pack if c.kind != "timeline_summary"]
         else:
+            if rerank_succeeded:
+                for t in timeline_candidates.values():
+                    if ":FN" in str(t.id) and float(t.metadata.get("r_prob", 0.0)) >= 0.40:
+                        hdr = (
+                            "[GLOBAL FORGET OVERRIDE | MANDATORY]: The user explicitly FORGOT "
+                            "and ERASED their previous specific preference on this topic! "
+                            "All other retrieved memories below about the user's profession, "
+                            "military/service background, engineering, or problem-solving "
+                            "MUST BE IGNORED for this question! "
+                            "Do NOT select ANY option that mentions specific games, puzzles, "
+                            "brain teasers, apps, problem-solving, or ties into the user's "
+                            "profession/service/engineering background — you MUST select ONLY "
+                            "the purely general, everyday, unpersonalized option!\n"
+                        )
+                        if not t.content.startswith("[GLOBAL FORGET OVERRIDE"):
+                            t.content = hdr + t.content
+                        t.metadata["is_global_constraint"] = True
             max_tl = min(5, max(1, request.top_k // 5))
             tl_list = sorted(
                 timeline_candidates.values(),
