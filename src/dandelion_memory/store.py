@@ -6,6 +6,7 @@ import math
 import re
 import sqlite3
 from array import array
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -93,6 +94,8 @@ class StoreConflictError(RuntimeError):
 
 IdempotencyConflictError = StoreConflictError
 
+_DEFAULT_VECTOR_CACHE_MAX_ENTRIES = 8192
+
 
 def vector_to_blob(vec: Sequence[float]) -> bytes:
     arr = array("f", (float(x) for x in vec))
@@ -157,14 +160,38 @@ class MemoryStore(Protocol):
 class SQLiteStore:
     """Single-stack SQLite-WAL + float32 vector cache + BM25 store (DESIGN.md v2.1)."""
 
-    def __init__(self, db_path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        db_path: str | Path = ":memory:",
+        *,
+        vector_cache_max_entries: int = _DEFAULT_VECTOR_CACHE_MAX_ENTRIES,
+    ) -> None:
         self.db_path = str(db_path)
         self._conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._in_tx = False
         self._active_deadline_check: Callable[[], bool] | None = None
-        self._vector_cache: dict[str, list[float]] = {}
+        self._vector_cache_max_entries = max(1, int(vector_cache_max_entries))
+        self._vector_cache: OrderedDict[str, Sequence[float]] = OrderedDict()
         self._init_schema()
+
+    def _get_cached_vector(self, chunk_id: str) -> Sequence[float] | None:
+        vec = self._vector_cache.get(chunk_id)
+        if vec is not None:
+            self._vector_cache.move_to_end(chunk_id)
+        return vec
+
+    def _cache_vector(self, chunk_id: str, embedding: Sequence[float]) -> Sequence[float]:
+        vec: Sequence[float]
+        if isinstance(embedding, array) and embedding.typecode == "f":
+            vec = embedding
+        else:
+            vec = array("f", (float(value) for value in embedding))
+        self._vector_cache[chunk_id] = vec
+        self._vector_cache.move_to_end(chunk_id)
+        while len(self._vector_cache) > self._vector_cache_max_entries:
+            self._vector_cache.popitem(last=False)
+        return vec
 
     def _check_deadline(self) -> None:
         if self._active_deadline_check is not None and self._active_deadline_check():
@@ -187,7 +214,7 @@ class SQLiteStore:
         self._in_tx = True
         prev_deadline_check = self._active_deadline_check
         self._active_deadline_check = deadline_check
-        cache_snapshot = dict(self._vector_cache)
+        cache_snapshot = OrderedDict(self._vector_cache)
         orig_connect = sqlite3.connect
         store_conn = self._conn
         target_db = self.db_path
@@ -767,7 +794,7 @@ class SQLiteStore:
             if len(parts) >= 3 and parts[-1].startswith("F") and parts[-1][1:].isdigit():
                 slot_id = parts[-1]
         blob = vector_to_blob(embedding)
-        self._vector_cache[chunk_id] = list(embedding)
+        self._cache_vector(chunk_id, embedding)
         conn = self._connect()
         conn.execute(
             """
@@ -2552,7 +2579,7 @@ class SQLiteStore:
             # P1-2: Pure cosine >= 0.58 is an independent OR condition;
             # for >=3 keywords, >=1 keyword hit + cosine >= 0.42 confirms hybrid match
             if not hit and target_vector:
-                vec = self._vector_cache.get(cid) or blob_to_vector(r["embedding"])
+                vec = self._get_cached_vector(cid) or blob_to_vector(r["embedding"])
                 cos_sim = cosine_similarity(target_vector, vec)
                 if cos_sim >= 0.58:
                     hit = True
@@ -2820,12 +2847,12 @@ class SQLiteStore:
             if fact_row is not None:
                 vec = blob_to_vector(fact_row["embedding"])
                 if not vec:
-                    vec = list(self._vector_cache.get(str(fact_row["chunk_id"])) or [])
+                    vec = list(self._get_cached_vector(str(fact_row["chunk_id"])) or [])
             if not vec:
-                vec = list(self._vector_cache.get(f"fact:{user_id}:{slot_id}") or [])
+                vec = list(self._get_cached_vector(f"fact:{user_id}:{slot_id}") or [])
             if not vec:
                 # 兼容旧式 fact chunk 命名查找
-                vec = list(self._vector_cache.get(f"tl:{user_id}:{subj}:{tag}") or [])
+                vec = list(self._get_cached_vector(f"tl:{user_id}:{subj}:{tag}") or [])
             if fact_row is None and not vec:
                 raise RuntimeError(
                     f"Fail-closed: missing active fact_item or embedding for timeline "
@@ -2877,11 +2904,10 @@ class SQLiteStore:
         result: list[dict[str, Any]] = []
         for r in rows:
             cid = str(r["chunk_id"])
-            vec = self._vector_cache.get(cid)
+            vec = self._get_cached_vector(cid)
             if vec is None:
-                vec = blob_to_vector(r["embedding"])
-                if vec:
-                    self._vector_cache[cid] = vec
+                decoded = blob_to_vector(r["embedding"])
+                vec = self._cache_vector(cid, decoded) if decoded else decoded
             result.append(
                 {
                     "chunk_id": cid,
@@ -2974,11 +3000,10 @@ class SQLiteStore:
             if not tg.startswith("其他/"):
                 continue
             cid = str(r["chunk_id"])
-            vec = self._vector_cache.get(cid)
+            vec = self._get_cached_vector(cid)
             if vec is None:
-                vec = blob_to_vector(r["embedding"])
-                if vec:
-                    self._vector_cache[cid] = vec
+                decoded = blob_to_vector(r["embedding"])
+                vec = self._cache_vector(cid, decoded) if decoded else decoded
             out.setdefault(tg, []).append(
                 {
                     "chunk_id": cid,
