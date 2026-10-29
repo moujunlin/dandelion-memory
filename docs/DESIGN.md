@@ -412,6 +412,14 @@ flowchart TD
 
 ---
 
+### 9.5 v3.1.2 Full 运行期缓存上限修复
+
+- v3.1.1 的 API 长生命周期里，`SQLiteStore._vector_cache` 会把每次写入和读取的 1024 维向量以 Python `list[float]` 永久保留。正式 Full 在 Add 11.1% 时已累计约 20 万个 chunk，进程 RSS 随数据量线性升至约 8 GiB；SQLite 中同批 float32 BLOB 仅约 0.8 GiB，确认增长来自无上限的 boxed-float 缓存。
+- v3.1.2 保留 SQLite 为完整向量正本，只让进程维护 8,192 项 LRU；缓存值使用 `array('f')`，单个 1024 维向量约 4 KiB，向量载荷上限约 32 MiB。事务回滚仍恢复进入事务前的缓存快照，淘汰不改变 SQLite 数据与检索结果。
+- 新增回归测试覆盖容量淘汰与命中刷新；全套 76 项测试及 Ruff 检查通过。取消的首次 Full 数据不作为成绩或容量结论。
+
+---
+
 ## 十、历次迭代踩坑与永久禁回退红线总表（v2.1 ~ v3.1.1 Pitfall Ledger）
 
 为防止后续迭代或外部模型评审时重复踩入历史已验证的负向改动，现将 `v2.1 ~ v3.1.1` 历次迭代踩过的所有坑、具体恶果与永久禁回退红线汇总如下。**任何后续修改或评审建议一旦触碰以下红线，直接一票否决：**
@@ -430,7 +438,6 @@ flowchart TD
 | **坑 10** | `v3.1` 初版实测 (`68e105d`) | **① 加无条件 `0.80 * rrf_val` 保底；② 卡片顶行硬盖 `Owner: X (Do NOT attribute to User)`；③ 给 `FN` 塞宽泛大类词（`_BROAD_CATEGORY_CUES`）且 `fact:FN` 挂 `parent_msg_id`；④ `_is_high_spec_kw` 把 `len>=8`/带空格词当单字墓碑触发器** | 在同一份 `p10_v25_clean.sqlite3` 上 `MCQ` 从 **`14/25 (56%)` 跌至 `11/25 (44%)`**：① `#136 密码泄露` 靠 BM25 词撞锁死 `0.80` 霸占 `Q14` Top-1；② `#37` 本人签名信被顶行 `Do NOT attribute` 反杀丢掉 `Q17`；③ `FN13` 靠宽泛词冲进 `Q18` Top-2 毒化正常题；④ `_is_high_spec_kw` 凭 `scheduling / preparations` 单字误杀 19 轮正常对话。 | **① 严禁加 `0.80 * rrf_val` 无条件保底（保持 `0.55*r + 0.45*rrf`）；② 严禁在卡片顶行加 `Owner: ... (Do NOT attribute)` 死命令；③ 严禁向 `FN` 注入宽泛大类词，`fact:FN` 必须 `parent_msg_id=None`；④ `_is_high_spec_kw` 仅限单 token 内部大写驼峰词（如 `MealPrepPro`）；⑤ 默认模型写死 `gpt-4o-mini`。** |
 | **坑 11** | `v3.1` 消融实测 (`2401368` 后二次实验) | **① 硬删或软隔离非 `Original` 的 `assistant` 百科科普切片（不进状态槽/不进卡片底部 `[提炼事实]`）；② 按问答对与重文稿动态切分提炼子窗口** | 无论是硬删还是软隔离非 `Original` `assistant` 切片，都会导致 `#76/#77 (Q22)` 对话卡丧失底部 `[提炼事实]` 重排锚点而掉出前 10（`R@10: 21/23 -> 20/23`），且 `Q18` 掉分（`MCQ` 从 **`15/25 (60.0%)` 跌至 `14/25 (56.0%)`**）；而动态重切子窗口会使活跃事实从 `47` 条膨胀至 `59` 条，导致 `R@5` 从 `17/23` 跌至 `14/23`、`R@20` 从 `23/23 (100%)` 跌至 `21/23`。 | **严禁在代码层硬删或从卡片 `[提炼事实]` / 状态槽中剥离非 `Original` `assistant` 提炼切片，也严禁改动 `range(0, len, 6)` 固定子窗口切分（零净收益/负收益改动一律全部回滚，保持 `2401368` 纯净基线）。** |
 | **坑 12** | `v3.1 -> v3.1.1` (`fix/v3-1-forget-collateral-guard`) | **① `extract_forget_target` 无祈使锚定，把 `"don't forget..."` / `"I don't remember..."` / `"remove from heat"` 当遗忘指令；② `_kw_hit` 用裸子串匹配（`'de'` 命中 `'decade'`，弯引号 `I’ve` 拆出 `'ve'` 命中 `'have'`）；③ `assistant` 多切片长文（`tag=None`）因 `distinct_tags` 为空被当成单主题整条连坐墓碑** | ① 在 `LoCoMo-Refined` 误触发 11 次、在 `LongMemEval-S` 误触发 17 次假遗忘；② 在 `PersonaMem-v2` 误杀 `#724`（`persona-3490`）与 18 切片长文 `#284`（`persona-3896`）；③ 在 `Persona 10` 把 `Q04` 的 15 切片长文 `msg:p10:20` 整条误杀。 | **① 遗忘触发必须锚定祈使遗忘句式并排除否定/感叹/食谱短语；② `_kw_hit` 必须走词边界 token 集合匹配，且 `_is_high_spec_kw` 仅在 `len(kw_list) <= 4` 时生效；③ 当 `assistant` 长文 `len(raw_slices) >= 3` 且配对 `user` 提问未被墓碑化时，必须按 `is_multi_topic = True` 仅局部墓碑化命中的切片。** |
-
 
 
 
